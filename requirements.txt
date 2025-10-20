@@ -1,0 +1,9 @@
+numpy
+scipy
+trimesh
+PySide6
+moderngl
+PyOpenGL
+imageio-ffmpeg
+imageio
+networkx
