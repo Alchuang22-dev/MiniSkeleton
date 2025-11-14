@@ -2,8 +2,12 @@ numpy
 scipy
 trimesh
 PySide6
+PyQt5
 moderngl
 PyOpenGL
 imageio-ffmpeg
 imageio
 networkx
+pyvista
+pyvistaqt
+vtk

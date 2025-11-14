@@ -2,8 +2,8 @@
 # 绑定骨架方面的函数
 from __future__ import annotations
 from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
-from typing import Dict, List, Optional
 
 @dataclass
 class Joint:
@@ -12,29 +12,6 @@ class Joint:
     bind_pose: np.ndarray      # (4,4) 关节在绑定时的局部/或全局矩阵（按你的约定）
     offset_matrix: np.ndarray  # (4,4) 逆绑定矩阵（skin bind）
 
-# -*- coding: utf-8 -*-
-"""
-Generic Skeleton & FK for rigging pipeline (cow-agnostic).
-
-Features
---------
-- Joint dataclass with parent index, bind local, inverse bind.
-- Build from bind positions (names + parents + (J,3) positions).
-- Forward kinematics (FK): local(4x4) -> global(4x4), respecting hierarchy.
-- Skinning matrices for LBS: M_skin[j] = G_current[j] @ inv_bind[j]
-- Utilities to create local transforms from (R, t) or quaternion.
-- Optional template auto-placement for quadrupeds via bbox (axis configurable).
-
-Notes
------
-- No cow-specific hard-coded offsets. Auto-placement is optional and parameterized.
-- All transforms are right-handed column-major math in numpy 2D arrays (4,4).
-"""
-
-from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
-import numpy as np
 
 
 # -----------------------
