@@ -3,14 +3,14 @@
 Spot 模型骨架绑定 UI（基于 rigging/ 下的新算法）
 
 功能：
-- 使用 data/single/spot/spot_control_mesh.obj 作为测试模型
-- 使用 Skeleton + quadruped_auto_place_from_bbox 自动生成四足骨架
+- 使用 data/single/spot/spot.glb 作为测试模型（统一从 GLB 读高模 + 骨架）
+- 使用 Skeleton + LBS 做交互式蒙皮预览
 - 使用 Pinocchio 风格的 heat weights 作为“完整蒙皮”
 - 使用最近关节 1-hot 作为“简化蒙皮”
 - 支持鼠标点击关节、拖拽关节（及其子关节）进行交互式变形预览
+- 支持简单的关键帧动画：记录 / 清空 / 播放
 """
 
-from rigging.mesh_io import Mesh
 import sys
 import numpy as np
 from PyQt5.QtWidgets import (
@@ -23,58 +23,67 @@ import pyvista as pv
 from pyvistaqt import QtInteractor
 import vtk
 from vtk.util.numpy_support import numpy_to_vtk
-from rigging.gltf_loader import load_skeleton_from_glb
 
-# === 新的 rigging 模块 ===
-from rigging.mesh_io import load_mesh
-from rigging.skeleton import Skeleton, quadruped_auto_place_from_bbox
-from rigging.weights_heat import compute_heat_weights, HeatWeightsConfig
+from rigging.mesh_io import Mesh
+from rigging.gltf_loader import load_mesh_and_skeleton_from_glb
+from rigging.skeleton import Skeleton
 from rigging.lbs import linear_blend_skinning
+from rigging.weights_heat import HeatWeightsConfig, compute_heat_weights
 
 
 class SpotRigUI(QMainWindow):
-    """Spot 模型骨架绑定 UI"""
+    """Spot 模型骨架绑定 + 简单关键帧动画 UI"""
 
     def __init__(self):
         super().__init__()
 
-        # 数据存储
-        self.mesh = None                 # rigging.mesh_io.Mesh
-        self.skeleton: Skeleton = None   # 自动生成的四足骨架
+        # ---------- 核心数据 ----------
+        self.mesh: Mesh | None = None
+        self.skeleton: Skeleton | None = None
         self.bones = []                  # [(parent, child), ...]
         self.weights = None              # 完整权重（heat weights）
         self.simple_weights = None       # 简化权重（最近关节 1-hot）
-        self.joint_transforms = None     # (J,4,4) 局部相对 bind 的增量
+        self.joint_transforms = None     # (J,4,4) 当前局部增量（相对 bind）
         self.initial_joint_transforms = None
 
-        # 选中的关节
+        # ---------- 交互状态 ----------
         self.selected_joint = None
         self.joint_sphere_actors = {}
-
-        # 坐标轴箭头
         self.axis_arrows = {}
         self.dragging_axis = None
-
-        # 拖拽状态
         self.is_dragging = False
         self.last_mouse_pos = None
 
-        # 缓存 Actor
+        # ---------- VTK / PyVista Actor 缓存 ----------
         self.mesh_actor = None
         self.bone_actors = []
         self.joint_actors = []
         self.gizmo_actors = []
         self.label_actor = None
 
-        # 延迟更新
+        # ---------- 延迟更新 ----------
         self.pending_update = False
         self.update_timer = QTimer()
         self.update_timer.setInterval(16)  # ~60 FPS
         self.update_timer.timeout.connect(self._deferred_update)
 
-        # 蒙皮模式：'full'（heat weights） 或 'simple'（最近关节）
+        # ---------- 蒙皮模式 ----------
+        # 'full'（heat weights） 或 'simple'（最近关节）
         self.skinning_mode = 'full'
 
+        # ---------- 简单关键帧动画 ----------
+        self.keyframes: list[np.ndarray] = []   # 每个元素是 (J,4,4)
+        self.current_frame_index: int = -1
+        self.is_playing: bool = False
+        self.play_timer = QTimer()
+        self.play_timer.setInterval(33)        # ~30 FPS
+        self.play_timer.timeout.connect(self._play_step)
+
+        # UI 组件引用（动画状态显示用）
+        self.keyframe_status_label: QLabel | None = None
+        self.play_button: QPushButton | None = None
+
+        # ---------- 初始化 UI & 模型 ----------
         self.init_ui()
         self.load_model()
 
@@ -86,7 +95,7 @@ class SpotRigUI(QMainWindow):
 
     def init_ui(self):
         """初始化 UI"""
-        self.setWindowTitle("Spot 骨架绑定工具（Heat Weights + LBS）")
+        self.setWindowTitle("Spot 骨架绑定工具（Heat Weights + LBS + Keyframes）")
         self.setGeometry(100, 100, 1400, 800)
 
         central_widget = QWidget()
@@ -99,14 +108,14 @@ class SpotRigUI(QMainWindow):
 
         # 右侧 3D 视图
         self.plotter = QtInteractor(self)
-        self.plotter.set_background('white')
+        self.plotter.set_background("white")
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(toolbar_widget)
         splitter.addWidget(self.plotter.interactor)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([250, 1150])
+        splitter.setSizes([260, 1140])
 
         main_layout.addWidget(splitter)
 
@@ -121,7 +130,7 @@ class SpotRigUI(QMainWindow):
     def create_toolbar(self):
         """创建左侧工具栏"""
         toolbar = QWidget()
-        toolbar.setFixedWidth(250)
+        toolbar.setFixedWidth(260)
         toolbar.setStyleSheet("""
             QWidget {
                 background-color: #f5f5f5;
@@ -195,7 +204,7 @@ class SpotRigUI(QMainWindow):
         title.setStyleSheet("font-size: 16px; font-weight: bold; color: #333;")
         layout.addWidget(title)
 
-        # 控制组
+        # ===== 控制组 =====
         control_group = QGroupBox("控制")
         control_layout = QVBoxLayout()
 
@@ -207,7 +216,7 @@ class SpotRigUI(QMainWindow):
         control_group.setLayout(control_layout)
         layout.addWidget(control_group)
 
-        # 蒙皮设置组
+        # ===== 蒙皮设置组 =====
         skinning_group = QGroupBox("蒙皮设置")
         skinning_layout = QVBoxLayout()
 
@@ -236,9 +245,36 @@ class SpotRigUI(QMainWindow):
         skinning_group.setLayout(skinning_layout)
         layout.addWidget(skinning_group)
 
+        # ===== 动画组（关键帧） =====
+        anim_group = QGroupBox("动画 / 关键帧")
+        anim_layout = QVBoxLayout()
+
+        btn_add_kf = QPushButton("📌 记录当前姿态为关键帧")
+        btn_add_kf.clicked.connect(self.on_add_keyframe)
+        anim_layout.addWidget(btn_add_kf)
+
+        btn_clear_kf = QPushButton("🧹 清空所有关键帧")
+        btn_clear_kf.clicked.connect(self.on_clear_keyframes)
+        anim_layout.addWidget(btn_clear_kf)
+
+        self.play_button = QPushButton("▶ 播放关键帧")
+        self.play_button.clicked.connect(self.on_toggle_play)
+        anim_layout.addWidget(self.play_button)
+
+        self.keyframe_status_label = QLabel("关键帧数：0 | 状态：停止")
+        self.keyframe_status_label.setStyleSheet(
+            "font-size: 11px; color: #555; background-color: #fff; "
+            "padding: 6px; border-radius: 3px; border: 1px solid #ddd;"
+        )
+        self.keyframe_status_label.setWordWrap(True)
+        anim_layout.addWidget(self.keyframe_status_label)
+
+        anim_group.setLayout(anim_layout)
+        layout.addWidget(anim_group)
+
         layout.addStretch()
 
-        info_label = QLabel("Spot Demo · Heat Weights + LBS")
+        info_label = QLabel("Spot Demo · Heat Weights + LBS + Keyframes")
         info_label.setStyleSheet("font-size: 10px; color: #999;")
         info_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(info_label)
@@ -248,24 +284,21 @@ class SpotRigUI(QMainWindow):
     # ---------------- Model / Skeleton / Weights ----------------
 
     def load_model(self):
+        """从 spot.glb 读取高模 + 骨架，并初始化权重 / 变形状态"""
         try:
             glb_path = "data/single/spot/spot.glb"
 
             print("\n==================== [STEP 1] LOAD MESH + SKELETON FROM GLB ====================")
             print(f"📦 从 GLB 读取高模 + 骨架: {glb_path}")
 
-            # 新：一次性从 glb 获得 vertices / faces / skeleton
-            from rigging.gltf_loader import load_mesh_and_skeleton_from_glb
             verts, faces, names, parents, joint_positions = load_mesh_and_skeleton_from_glb(glb_path)
 
             print(f"  ▶ glb vertices: {verts.shape}")
             print(f"  ▶ glb faces   : {faces.shape}")
 
-            # 用 glb 的高模构造 Mesh（不再用 spot_control_mesh.obj）
-            self.mesh = Mesh(
-                vertices=verts.astype(np.float32),
-                faces=faces.astype(np.int32),
-            )
+            # Mesh
+            self.mesh = Mesh(vertices=verts.astype(np.float32),
+                             faces=faces.astype(np.int32))
             self.mesh.ensure_vertex_normals(recompute=True)
 
             V = self.mesh.vertices
@@ -279,12 +312,11 @@ class SpotRigUI(QMainWindow):
             print(f"  ▶ mesh center  : {mesh_center}")
             print(f"  ▶ mesh scale   : {mesh_scale}")
 
-            # ==================== [STEP 2] BUILD SKELETON ====================
+            # Skeleton
             print("\n==================== [STEP 2] BUILD SKELETON ====================")
             self.skeleton = Skeleton.from_bind_positions(names, parents, joint_positions)
             print(f"  ▶ Skeleton 构建完成: {self.skeleton.n} joints")
 
-            # 记录骨骼连线（parent-child）
             self.bones = [
                 (j.parent, i)
                 for i, j in enumerate(self.skeleton.joints)
@@ -292,7 +324,6 @@ class SpotRigUI(QMainWindow):
             ]
             print(f"  ▶ bones (edges): {len(self.bones)} 条")
 
-            # ==================== [STEP 3] FK 检查 ====================
             bind_locals = [j.bind_local for j in self.skeleton.joints]
             G_bind = self.skeleton.forward_kinematics_local(bind_locals)
 
@@ -303,33 +334,32 @@ class SpotRigUI(QMainWindow):
             print(f"  ▶ FK joint center     : {fk_center}")
             print(f"  ▶ FK - Mesh center    : {fk_center - mesh_center}")
 
-            # ==================== [STEP 4] HEAT WEIGHTS ====================
+            # Heat weights
             print("\n==================== [STEP 4] HEAT WEIGHTS ====================")
-            from rigging.weights_heat import HeatWeightsConfig, compute_heat_weights
-
-            cfg = HeatWeightsConfig(
-                tau=0.5,
-                topk=4,
-                smooth_passes=1,
-            )
+            cfg = HeatWeightsConfig(tau=0.5, topk=4, smooth_passes=1)
             print("🔥 计算 Heat 权重（Pinocchio-style）...")
             self.weights = compute_heat_weights(self.mesh, self.skeleton, cfg)
             print("  ▶ Heat weights shape:", self.weights.shape)
 
-            # ==================== [STEP 5] SIMPLE WEIGHTS ====================
+            # Simple weights
             print("\n==================== [STEP 5] SIMPLE WEIGHTS ====================")
             joint_positions_fk = G_bind[:, :3, 3]
             self.simple_weights = self.compute_simple_weights(self.mesh.vertices, joint_positions_fk)
             print("  ▶ Simple weights computed")
 
-            # ==================== [STEP 6] INIT TRANSFORMS ====================
+            # 初始化局部增量
             print("\n==================== [STEP 6] INIT TRANSFORMS ====================")
             J = self.skeleton.n
-            self.joint_transforms = np.eye(4)[None, :, :].repeat(J, axis=0)
+            self.joint_transforms = np.eye(4, dtype=np.float32)[None, :, :].repeat(J, axis=0)
             self.initial_joint_transforms = self.joint_transforms.copy()
             print("  ▶ transforms initialized")
 
-            # ==================== [STEP 7] RENDER ====================
+            # 清空关键帧
+            self.keyframes.clear()
+            self.current_frame_index = -1
+            self._update_keyframe_status()
+
+            # 渲染
             print("\n==================== [STEP 7] RENDER ====================")
             self.render_scene_full()
 
@@ -342,7 +372,6 @@ class SpotRigUI(QMainWindow):
             import traceback
             traceback.print_exc()
             self.statusBar().showMessage(f"❌ 加载失败：{e}")
-
 
     @staticmethod
     def compute_simple_weights(vertices, joint_positions):
@@ -374,6 +403,8 @@ class SpotRigUI(QMainWindow):
             self.statusBar().showMessage("⚠️ 没有可重置的初始状态")
             return
 
+        self.stop_playback()
+
         self.joint_transforms = self.initial_joint_transforms.copy()
         self.selected_joint = None
         self.update_deformed_mesh_only()
@@ -389,6 +420,83 @@ class SpotRigUI(QMainWindow):
         mode_name = self.skinning_combo.currentText()
         self.statusBar().showMessage(f"✅ 切换到：{mode_name}")
         print(f"🎨 蒙皮模式切换为：{self.skinning_mode}")
+
+    # ---------- 关键帧动画相关 ----------
+
+    def on_add_keyframe(self):
+        """记录当前关节姿态为关键帧"""
+        if self.joint_transforms is None:
+            self.statusBar().showMessage("⚠️ 尚未加载骨架，无法记录关键帧")
+            return
+
+        self.keyframes.append(self.joint_transforms.copy())
+        self.current_frame_index = len(self.keyframes) - 1
+        self._update_keyframe_status()
+        self.statusBar().showMessage(f"✅ 已记录关键帧 #{self.current_frame_index}")
+        print(f"📌 记录关键帧 #{self.current_frame_index}")
+
+    def on_clear_keyframes(self):
+        """清空所有关键帧"""
+        self.stop_playback()
+        self.keyframes.clear()
+        self.current_frame_index = -1
+        self._update_keyframe_status()
+        self.statusBar().showMessage("🧹 已清空所有关键帧")
+        print("🧹 清空所有关键帧")
+
+    def on_toggle_play(self):
+        """开始 / 停止播放"""
+        if not self.is_playing:
+            if not self.keyframes:
+                self.statusBar().showMessage("⚠️ 没有关键帧可以播放，请先记录至少一个关键帧")
+                return
+            self.start_playback()
+        else:
+            self.stop_playback()
+
+    def start_playback(self):
+        """开始关键帧播放"""
+        if not self.keyframes:
+            return
+        self.is_playing = True
+        if self.current_frame_index < 0:
+            self.current_frame_index = 0
+        self.play_timer.start()
+        if self.play_button is not None:
+            self.play_button.setText("⏸ 停止播放")
+        self._update_keyframe_status()
+        print("▶ 开始播放关键帧")
+
+    def stop_playback(self):
+        """停止关键帧播放"""
+        if not self.is_playing:
+            return
+        self.is_playing = False
+        self.play_timer.stop()
+        if self.play_button is not None:
+            self.play_button.setText("▶ 播放关键帧")
+        self._update_keyframe_status()
+        print("⏸ 停止播放")
+
+    def _play_step(self):
+        """播放计时器回调：切换到下一帧"""
+        if not self.keyframes:
+            self.stop_playback()
+            return
+
+        self.current_frame_index = (self.current_frame_index + 1) % len(self.keyframes)
+        self.joint_transforms = self.keyframes[self.current_frame_index].copy()
+        self.update_deformed_mesh_only()
+        self._update_keyframe_status()
+
+    def _update_keyframe_status(self):
+        """更新关键帧状态文本"""
+        if self.keyframe_status_label is None:
+            return
+        count = len(self.keyframes)
+        state = "播放中" if self.is_playing else "停止"
+        idx_str = f"当前帧：{self.current_frame_index}" if self.current_frame_index >= 0 else "当前帧：-"
+        self.keyframe_status_label.setText(f"关键帧数：{count} | {idx_str} | 状态：{state}")
 
     # ---------------- 事件过滤 / 鼠标交互 ----------------
 
@@ -570,11 +678,10 @@ class SpotRigUI(QMainWindow):
         """使用当前关节姿态和选定权重计算变形后的顶点"""
         pose = [self.joint_transforms[j] for j in range(self.skeleton.n)]
 
-        # 生成 skinning matrices: M_skin[j] = G_current[j] @ inv_bind[j]
+        # skinning matrices: M_skin[j] = G_current[j] @ inv_bind[j]
         M_skin = self.skeleton.skinning_matrices(pose)  # (J,4,4)
 
-        # 根据模式选择权重
-        if self.skinning_mode == 'simple':
+        if self.skinning_mode == "simple":
             weights = self.simple_weights
         else:
             weights = self.weights
@@ -583,10 +690,9 @@ class SpotRigUI(QMainWindow):
             self.mesh.vertices,
             weights,
             M_skin,
-            topk=None,       # 权重已经经过 top-k 和归一化，无需再次处理
-            normalize=False
+            topk=None,
+            normalize=False,
         )
-
         return deformed_vertices
 
     # ---------------- 渲染相关 ----------------
@@ -615,13 +721,13 @@ class SpotRigUI(QMainWindow):
         mesh_pv = pv.PolyData(deformed_vertices, faces_with_count)
         self.mesh_actor = self.plotter.add_mesh(
             mesh_pv,
-            color='lightblue',
+            color="lightblue",
             opacity=0.6,
             show_edges=True,
-            edge_color='navy',
+            edge_color="navy",
             line_width=0.3,
             smooth_shading=True,
-            pickable=False
+            pickable=False,
         )
 
         # 2. 骨骼（线段）
@@ -631,10 +737,10 @@ class SpotRigUI(QMainWindow):
             line = pv.Line(p1, p2)
             actor = self.plotter.add_mesh(
                 line,
-                color='darkred',
+                color="darkred",
                 line_width=8,
                 opacity=0.8,
-                pickable=False
+                pickable=False,
             )
             self.bone_actors.append((actor, jp, jc))
 
@@ -644,15 +750,15 @@ class SpotRigUI(QMainWindow):
                 radius=sphere_radius,
                 center=pos.tolist(),
                 theta_resolution=16,
-                phi_resolution=16
+                phi_resolution=16,
             )
-            color = 'yellow' if i == self.selected_joint else 'red'
+            color = "yellow" if i == self.selected_joint else "red"
             actor = self.plotter.add_mesh(
                 sphere,
                 color=color,
                 opacity=0.9,
                 pickable=True,
-                lighting=True
+                lighting=True,
             )
             self.joint_sphere_actors[actor] = i
             self.joint_actors.append((actor, i, sphere_radius))
@@ -661,7 +767,7 @@ class SpotRigUI(QMainWindow):
         self.update_gizmo_only()
 
         # 5. 相机
-        if not hasattr(self, '_camera_set'):
+        if not hasattr(self, "_camera_set"):
             self.plotter.reset_camera()
             self.plotter.camera.elevation = 15
             self.plotter.camera.azimuth = -60
@@ -699,7 +805,7 @@ class SpotRigUI(QMainWindow):
                 radius=radius,
                 center=pos.tolist(),
                 theta_resolution=16,
-                phi_resolution=16
+                phi_resolution=16,
             )
             actor.GetMapper().SetInputData(sphere)
 
@@ -731,9 +837,9 @@ class SpotRigUI(QMainWindow):
         arrow_length = mesh_size * 0.1
 
         axes = [
-            ('x', np.array([1.0, 0.0, 0.0]), 'red'),
-            ('y', np.array([0.0, 1.0, 0.0]), 'green'),
-            ('z', np.array([0.0, 0.0, 1.0]), 'blue')
+            ("x", np.array([1.0, 0.0, 0.0]), "red"),
+            ("y", np.array([0.0, 1.0, 0.0]), "green"),
+            ("z", np.array([0.0, 0.0, 1.0]), "blue"),
         ]
 
         for axis_name, direction, color in axes:
@@ -743,14 +849,14 @@ class SpotRigUI(QMainWindow):
                 tip_length=0.25,
                 tip_radius=0.1,
                 shaft_radius=0.03,
-                scale=float(arrow_length)
+                scale=float(arrow_length),
             )
             actor = self.plotter.add_mesh(
                 arrow,
                 color=color,
                 opacity=0.8,
                 pickable=True,
-                lighting=True
+                lighting=True,
             )
             self.axis_arrows[actor] = (axis_name, direction)
             self.gizmo_actors.append(actor)
@@ -764,10 +870,10 @@ class SpotRigUI(QMainWindow):
             [f"[{self.selected_joint}] {joint_name}"],
             font_size=14,
             bold=True,
-            text_color='black',
-            point_color='yellow',
+            text_color="black",
+            point_color="yellow",
             point_size=20,
-            shape_opacity=0.8
+            shape_opacity=0.8,
         )
 
         self.plotter.update()
@@ -775,11 +881,11 @@ class SpotRigUI(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    app.setStyle('Fusion')
+    app.setStyle("Fusion")
     window = SpotRigUI()
     window.show()
     sys.exit(app.exec_())
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
