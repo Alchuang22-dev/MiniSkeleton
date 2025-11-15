@@ -226,10 +226,26 @@ def compute_heat_weights(mesh: Mesh, skel, cfg: Optional[HeatWeightsConfig] = No
         # CG 逐列
         for j in range(J):
             rhs = S[:, j].astype(np.float32)
-            sol, info = spla.cg(A_sys, rhs, tol=cfg.cg_tol, maxiter=cfg.cg_maxiter)
+
+            try:
+                # SciPy 新版：cg(A, b, rtol=..., atol=..., maxiter=...)
+                sol, info = spla.cg(
+                    A_sys, rhs,
+                    rtol=cfg.cg_tol,
+                    atol=0.0,
+                    maxiter=cfg.cg_maxiter,
+                )
+            except TypeError:
+                # SciPy 旧版：cg(A, b, maxiter=...)（无 rtol/atol）
+                sol, info = spla.cg(
+                    A_sys, rhs,
+                    maxiter=cfg.cg_maxiter,
+                )
+
             if info != 0:
-                # 失败回退：用 RHS 作为近似，避免中断
+                # 失败回退
                 sol = rhs
+
             W[:, j] = np.maximum(sol.astype(np.float32), 0.0)
 
     # 可选：微调平滑（小步数的拉普拉斯一阶迭代），避免噪点

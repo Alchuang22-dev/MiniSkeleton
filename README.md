@@ -11,11 +11,12 @@ animation-skeleton/
 ├─ out/                          # 渲染帧与视频输出
 │  ├─ frames/
 │  └─ videos/
-├─ rigging/                      # 算法核心（你要自己实现的部分）
+├─ rigging/                      # 算法核心
 │  ├─ __init__.py
 │  ├─ mesh_io.py                 # OBJ/PLY 读写、拓扑检查、法线/UV修复
 │  ├─ skeleton.py                # 关节/骨骼数据结构 + FK（含层级/约束）
 │  ├─ weights_nearest.py         # 最近骨骼/双骨插值权重（基础必做）
+│  ├─ gltf_loader.py             # GLB读写
 │  ├─ weights_heat.py            # 热扩散/拉普拉斯权重（进阶）
 │  ├─ lbs.py                     # 线性混合蒙皮 (Linear Blend Skinning)
 │  ├─ deformation_transfer.py    # （可选）DT 动画复用

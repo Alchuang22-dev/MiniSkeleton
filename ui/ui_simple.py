@@ -10,6 +10,7 @@ Spot 模型骨架绑定 UI（基于 rigging/ 下的新算法）
 - 支持鼠标点击关节、拖拽关节（及其子关节）进行交互式变形预览
 """
 
+from rigging.mesh_io import Mesh
 import sys
 import numpy as np
 from PyQt5.QtWidgets import (
@@ -22,6 +23,7 @@ import pyvista as pv
 from pyvistaqt import QtInteractor
 import vtk
 from vtk.util.numpy_support import numpy_to_vtk
+from rigging.gltf_loader import load_skeleton_from_glb
 
 # === 新的 rigging 模块 ===
 from rigging.mesh_io import load_mesh
@@ -75,6 +77,10 @@ class SpotRigUI(QMainWindow):
 
         self.init_ui()
         self.load_model()
+
+        # 可选：补一下法线，方便可视化
+        if self.mesh is not None:
+            self.mesh.ensure_vertex_normals(recompute=True)
 
     # ---------------- UI 初始化 ----------------
 
@@ -242,59 +248,101 @@ class SpotRigUI(QMainWindow):
     # ---------------- Model / Skeleton / Weights ----------------
 
     def load_model(self):
-        """加载 Spot 模型并构建骨架 + 权重"""
         try:
-            # 1) 加载 Spot 控制网格
-            obj_path = "data/single/spot/spot_control_mesh.obj"
-            print(f"📦 加载网格: {obj_path}")
-            self.mesh = load_mesh(obj_path, center=False, scale_to_unit=False)
+            glb_path = "data/single/spot/spot.glb"
 
-            # 2) 自动生成四足骨架（基于 bbox 的 quadruped 模板）
-            aabb_min, aabb_max = self.mesh.aabb
-            names, parents, pos = quadruped_auto_place_from_bbox(
-                aabb_min, aabb_max, up_axis="y"  # 如果 Spot 是 Z-up，可改成 "z"
+            print("\n==================== [STEP 1] LOAD MESH + SKELETON FROM GLB ====================")
+            print(f"📦 从 GLB 读取高模 + 骨架: {glb_path}")
+
+            # 新：一次性从 glb 获得 vertices / faces / skeleton
+            from rigging.gltf_loader import load_mesh_and_skeleton_from_glb
+            verts, faces, names, parents, joint_positions = load_mesh_and_skeleton_from_glb(glb_path)
+
+            print(f"  ▶ glb vertices: {verts.shape}")
+            print(f"  ▶ glb faces   : {faces.shape}")
+
+            # 用 glb 的高模构造 Mesh（不再用 spot_control_mesh.obj）
+            self.mesh = Mesh(
+                vertices=verts.astype(np.float32),
+                faces=faces.astype(np.int32),
             )
-            self.skeleton = Skeleton.from_bind_positions(names, parents, pos)
+            self.mesh.ensure_vertex_normals(recompute=True)
 
-            # 生成骨段列表（parent, child）
+            V = self.mesh.vertices
+            mesh_aabb_min = V.min(axis=0)
+            mesh_aabb_max = V.max(axis=0)
+            mesh_center = (mesh_aabb_min + mesh_aabb_max) * 0.5
+            mesh_scale = np.linalg.norm(mesh_aabb_max - mesh_aabb_min)
+
+            print(f"  ▶ mesh AABB min: {mesh_aabb_min}")
+            print(f"  ▶ mesh AABB max: {mesh_aabb_max}")
+            print(f"  ▶ mesh center  : {mesh_center}")
+            print(f"  ▶ mesh scale   : {mesh_scale}")
+
+            # ==================== [STEP 2] BUILD SKELETON ====================
+            print("\n==================== [STEP 2] BUILD SKELETON ====================")
+            self.skeleton = Skeleton.from_bind_positions(names, parents, joint_positions)
+            print(f"  ▶ Skeleton 构建完成: {self.skeleton.n} joints")
+
+            # 记录骨骼连线（parent-child）
             self.bones = [
-                (j.parent, idx)
-                for idx, j in enumerate(self.skeleton.joints)
-                if j.parent >= 0
+                (j.parent, i)
+                for i, j in enumerate(self.skeleton.joints)
+                if j.parent is not None and j.parent >= 0
             ]
+            print(f"  ▶ bones (edges): {len(self.bones)} 条")
 
-            # 关节 bind 姿势位置（GLOBAL）
+            # ==================== [STEP 3] FK 检查 ====================
             bind_locals = [j.bind_local for j in self.skeleton.joints]
-            G_bind = self.skeleton.forward_kinematics_local(bind_locals)  # (J,4,4)
-            joint_positions = G_bind[:, :3, 3]
+            G_bind = self.skeleton.forward_kinematics_local(bind_locals)
 
-            # 3) 计算 Heat 权重（Pinocchio 风格）
+            print(f"  ▶ G_bind shape: {G_bind.shape}")
+            print(f"  ▶ G_bind joints (first 5 positions):\n{G_bind[:5, :3, 3]}")
+
+            fk_center = G_bind[:, :3, 3].mean(axis=0)
+            print(f"  ▶ FK joint center     : {fk_center}")
+            print(f"  ▶ FK - Mesh center    : {fk_center - mesh_center}")
+
+            # ==================== [STEP 4] HEAT WEIGHTS ====================
+            print("\n==================== [STEP 4] HEAT WEIGHTS ====================")
+            from rigging.weights_heat import HeatWeightsConfig, compute_heat_weights
+
+            cfg = HeatWeightsConfig(
+                tau=0.5,
+                topk=4,
+                smooth_passes=1,
+            )
             print("🔥 计算 Heat 权重（Pinocchio-style）...")
-            cfg = HeatWeightsConfig(tau=0.5, topk=4, smooth_passes=1)
             self.weights = compute_heat_weights(self.mesh, self.skeleton, cfg)
+            print("  ▶ Heat weights shape:", self.weights.shape)
 
-            # 4) 简化权重（最近关节 1-hot）
-            print("🎯 计算简化权重（最近关节 1-hot）...")
-            self.simple_weights = self.compute_simple_weights(self.mesh.vertices, joint_positions)
+            # ==================== [STEP 5] SIMPLE WEIGHTS ====================
+            print("\n==================== [STEP 5] SIMPLE WEIGHTS ====================")
+            joint_positions_fk = G_bind[:, :3, 3]
+            self.simple_weights = self.compute_simple_weights(self.mesh.vertices, joint_positions_fk)
+            print("  ▶ Simple weights computed")
 
-            # 5) 初始局部增量（相对 bind pose）为单位矩阵
+            # ==================== [STEP 6] INIT TRANSFORMS ====================
+            print("\n==================== [STEP 6] INIT TRANSFORMS ====================")
             J = self.skeleton.n
-            self.joint_transforms = np.eye(4, dtype=np.float32)[None, :, :].repeat(J, axis=0)
+            self.joint_transforms = np.eye(4)[None, :, :].repeat(J, axis=0)
             self.initial_joint_transforms = self.joint_transforms.copy()
+            print("  ▶ transforms initialized")
 
-            # 6) 初始化场景
+            # ==================== [STEP 7] RENDER ====================
+            print("\n==================== [STEP 7] RENDER ====================")
             self.render_scene_full()
 
             self.statusBar().showMessage(
-                f"✅ 加载 Spot 成功：{self.skeleton.n} 个关节，{len(self.mesh.vertices)} 个顶点"
+                f"✅ Spot(glb) 加载成功：{self.skeleton.n} 个关节, {self.mesh.n_vertices} 顶点"
             )
-            print("✅ Spot 模型与骨架加载成功")
 
         except Exception as e:
-            print(f"加载失败：{e}")
+            print("加载失败：", e)
             import traceback
             traceback.print_exc()
             self.statusBar().showMessage(f"❌ 加载失败：{e}")
+
 
     @staticmethod
     def compute_simple_weights(vertices, joint_positions):
