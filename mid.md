@@ -87,19 +87,109 @@
    - 可以基于顶点在骨骼方向上的投影参数 ($t\in[0,1]$) 做线性插值，调节父子骨权重比例；
    - 这样关节弯曲时形变更自然。
 
-算法优点：
+双骨差值法仅依赖少量几何操作（点到线段距离），实现简单；但是这种蒙皮方式对骨骼密度和布置较敏感，在复杂拓扑处容易出现权重不连续。
 
-- 依赖少量几何操作（点到线段距离），实现简单；
-- 适合作为初始权重或监控权重场是否“跑偏”。
+双骨插值的部分关键代码是：
 
-缺点：
+```python
+def compute_nearest_bilinear_weights(
+    verts: np.ndarray,            # (N,3)
+    skel,                         # rigging.skeleton.Skeleton
+    config: Optional[NearestBilinearConfig] = None,
+) -> np.ndarray:
+    if config is None:
+        config = NearestBilinearConfig()
 
-- 对骨骼密度和布置较敏感；
-- 在复杂拓扑处容易出现权重不连续。
+    V = np.asarray(verts, dtype=np.float32)
+    N = V.shape[0]
+    parents = skel.parents()
+    edges = _bone_edges_from_parents(parents)    # (B,2)
+    if edges.size == 0:
+        raise ValueError("Skeleton has no bones (no parent-child pairs).")
+
+    # Bind joint positions and bone endpoints
+    J_pos = _global_bind_positions(skel)        # (J,3)
+    A = J_pos[edges[:, 0]]                      # (B,3) parent
+    B = J_pos[edges[:, 1]]                      # (B,3) child
+    AB = B - A
+    seg_lengths = np.linalg.norm(AB, axis=1)    # (B,)
+
+    sigma = config.sigma if (config.sigma is not None) else _auto_sigma(seg_lengths)
+
+    # Prepare output
+    J = J_pos.shape[0]
+    W = np.zeros((N, J), dtype=np.float32)
+
+    # Chunked processing to limit memory footprint
+    bs = int(config.chunk_size)
+    for start in range(0, N, bs):
+        end = min(N, start + bs)
+        Vc = V[start:end]  # (Nv,3)
+
+        t, d, _ab2 = _project_points_to_segments_batch(Vc, A, B)  # (Nv,B) each
+
+        # pick k nearest bones per vertex
+        K = int(max(1, config.k_bones))
+        if K >= t.shape[1]:
+            K = t.shape[1]
+
+        # indices of K smallest distances along axis=1
+        # argpartition faster than argsort
+        idx_part = np.argpartition(d, K-1, axis=1)[:, :K]           # (Nv,K)
+        # sort those K by distance ascending for stability
+        row_ids = np.arange(idx_part.shape[0])[:, None]
+        d_sorted = np.take_along_axis(d, idx_part, axis=1)
+        order = np.argsort(d_sorted, axis=1)
+        bone_ids = np.take_along_axis(idx_part, order, axis=1)      # (Nv,K)
+        d_sorted = np.take_along_axis(d_sorted, order, axis=1)
+        t_sorted = np.take_along_axis(t, idx_part, axis=1)
+        t_sorted = np.take_along_axis(t_sorted, order, axis=1)
+
+        # radial falloff per bone
+        F = _radial_weight(d_sorted, sigma=sigma, mode=config.falloff, eps=config.eps)  # (Nv,K)
+
+        # accumulate contributions to joints
+        for k in range(K):
+            b_ids = bone_ids[:, k]                   # (Nv,)
+            t_k = t_sorted[:, k]                     # (Nv,)
+            f_k = F[:, k]                            # (Nv,)
+
+            j_parent = edges[b_ids, 0]               # (Nv,)
+            j_child  = edges[b_ids, 1]               # (Nv,)
+
+            w_parent = (1.0 - t_k) * f_k
+            w_child  = t_k * f_k
+
+            # scatter-add
+            W[start:end, j_parent] += w_parent
+            W[start:end, j_child]  += w_child
+
+        # prune to max_influences if requested (dense path)
+        if config.max_influences and config.max_influences > 0:
+            mi = int(config.max_influences)
+            # keep top-mi per row
+            # argpartition descending
+            # NOTE: we operate on the chunk only
+            idx_desc = np.argpartition(-W[start:end], kth=mi-1, axis=1)
+            keep_cols = idx_desc[:, :mi]
+            mask = np.zeros_like(W[start:end], dtype=bool)
+            rr = np.arange(end - start)[:, None]
+            mask[rr, keep_cols] = True
+            W[start:end][~mask] = 0.0
+
+        # renormalize chunk
+        if config.renormalize:
+            rowsum = np.sum(W[start:end], axis=1, keepdims=True)
+            rowsum[rowsum < config.eps] = 1.0
+            W[start:end] /= rowsum
+
+    return W
+
+```
 
 ### 2.2 Heat Diffusion 权重（weights_heat.py）
 
-这是主要的“生产级”权重算法，参考 Pinocchio 等工作中的**基于热传导的骨骼权重**思想。核心思想：
+这是主要的权重算法，参考 Pinocchio 等工作中的**基于热传导的骨骼权重**思想。核心思想是：
 
 > 把每个骨骼关节当作“热源”，在三角形网格上做热扩散，最终稳态温度场即为该关节的权重分布。
 
@@ -165,11 +255,49 @@ v_i' = \sum_j W_{ij} ; (T_j , T_j^{\text{bind}^{-1}}) ; \hat{v}_i
 - ($\hat{v}_i$) 为 Bind Pose 下的齐次坐标；
 - ($T_j^{\text{bind}}$) 由 GLB 的 `inverseBindMatrices` 或 Skeleton 的绑定位姿推得。
 
-Heat 权重的好处：
+Heat 权重的好处包括以下要点：
 
 - 权重场在模型表面**连续且平滑**；
 - 在关节附近自然实现多骨“混合”控制，弯曲时不易产生明显折痕；
 - 对骨架布置有一定鲁棒性，不要求手动刷权。
+
+Heat权重的关键算法内容包括：
+
+```python
+    # σ 自动估计：中位骨段长度的一半（经验值）
+    if cfg.sigma is None:
+        med = float(np.median(seg_len))
+        cfg_sigma = max(0.5 * med, 1e-3)
+    else:
+        cfg_sigma = float(cfg.sigma)
+
+    # 计算网格邻接与拉普拉斯
+    neighbors, L = compute_vertex_adjacency(mesh)
+    if L is None:
+        raise RuntimeError("No Laplacian available (SciPy missing?).")
+
+    # 随机游走标准化 Laplacian：L_rw = D^{-1} L
+    deg = np.asarray(L.sum(axis=1)).ravel()
+    deg[deg < 1e-16] = 1.0
+    Dinv = sp.diags(1.0 / deg, 0, shape=L.shape)
+    L_rw = Dinv @ L
+
+    # A = I - tau * L_rw
+    I = sp.identity(L.shape[0], format="csr", dtype=np.float32)
+    A_sys = (I - cfg.tau * L_rw).tocsr()
+
+    # 预处理/分解（一次，多 RHS 复用）
+    solver_mode = cfg.solver.lower()
+    do_splu = (solver_mode == "splu" or solver_mode == "auto")
+    lu = None
+    if do_splu:
+        try:
+            lu = spla.splu(A_sys.tocsc())
+        except Exception:
+            # 回退到 CG
+            lu = None
+            solver_mode = "cg"
+```
 
 ### 2.3 蒙皮效果展示
 
@@ -189,7 +317,6 @@ Heat 权重的好处：
 |---|---|
 |Ilya Baran and Jovan Popović. 2007. Automatic rigging and animation of 3D characters. ACM Trans. Graph. 26, 3 (July 2007), 72–es.|https://www.cs.toronto.edu/~jacobson/seminar/baran-and-popovic-2007.pdf|
 |Automatic Skinning using the Mixed Finite Element Method (Arxiv)|https://arxiv.org/html/2408.04066v1|
-
 
 
 
