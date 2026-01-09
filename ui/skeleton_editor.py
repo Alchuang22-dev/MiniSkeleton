@@ -4,19 +4,28 @@ from __future__ import annotations
 
 import sys
 import numpy as np
-from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QApplication, QHBoxLayout, QMainWindow, QSplitter, QWidget
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QHBoxLayout,
+    QMainWindow,
+    QSplitter,
+    QWidget,
+)
 
 from rigging.mesh_io import Mesh
 from rigging.gltf_loader import load_mesh_and_skeleton_from_glb
 from rigging.skeleton import Skeleton
-from rigging.lbs import linear_blend_skinning
+from rigging.lbs import linear_blend_skinning, make_topk_weights
 from rigging.weights_heat import HeatWeightsConfig, compute_heat_weights
+from rigging.rig_io import save_rig_npz
 
 from ui.action_timeline import ActionTimeline
 from ui.export_panel import RigControlPanel
 from ui.viewport import RigViewport
 from ui.weight_tools import compute_simple_weights
+from ui.style import apply_style
 
 
 class SpotRigWindow(QMainWindow):
@@ -29,14 +38,21 @@ class SpotRigWindow(QMainWindow):
         self.mesh: Mesh | None = None
         self.skeleton: Skeleton | None = None
         self.bones: list[tuple[int, int]] = []
+        self.joint_names: list[str] = []
+        self.joint_parents: list[int] = []
+        self.bind_positions: np.ndarray | None = None
         self.weights = None
         self.simple_weights = None
+        self.weights_topk = None
+        self.simple_weights_topk = None
         self.joint_transforms = None  # (J,4,4)
         self.initial_joint_transforms = None
+        self.weights_dirty = False
 
         # Interaction state
         self.selected_joint: int | None = None
         self.skinning_mode = "full"
+        self.compile_mode = False
 
         # UI components
         self.timeline: ActionTimeline | None = None
@@ -70,6 +86,11 @@ class SpotRigWindow(QMainWindow):
             timeline_widget=self.timeline,
             on_reset=self.reset_to_initial,
             on_skinning_change=self.on_skinning_mode_changed,
+            on_toggle_compile=self.set_compile_mode,
+            on_add_joint=self.add_joint,
+            on_set_parent=self.reparent_selected_joint,
+            on_recompute_weights=self.recompute_weights,
+            on_save_rig=self.save_rig_bundle,
         )
         self.viewport = RigViewport(self, self._notify)
 
@@ -113,6 +134,9 @@ class SpotRigWindow(QMainWindow):
             print("\n==================== [STEP 2] BUILD SKELETON ====================")
             self.skeleton = Skeleton.from_bind_positions(names, parents, joint_positions)
             print(f"  - Skeleton joints: {self.skeleton.n}")
+            self.joint_names = list(names)
+            self.joint_parents = [int(p) for p in parents]
+            self.bind_positions = np.array(joint_positions, dtype=np.float32, copy=True)
 
             self.bones = [
                 (j.parent, i)
@@ -135,11 +159,15 @@ class SpotRigWindow(QMainWindow):
             print("[INFO] Computing heat weights (Pinocchio style)...")
             self.weights = compute_heat_weights(self.mesh, self.skeleton, cfg)
             print("  - Heat weights shape:", self.weights.shape)
+            topk = min(int(cfg.topk or 4), self.skeleton.n)
+            self.weights_topk = make_topk_weights(self.weights, topk)
 
             print("\n==================== [STEP 5] SIMPLE WEIGHTS ====================")
             joint_positions_fk = G_bind[:, :3, 3]
             self.simple_weights = compute_simple_weights(self.mesh.vertices, joint_positions_fk)
             print("  - Simple weights computed")
+            self.simple_weights_topk = make_topk_weights(self.simple_weights, 1)
+            self.weights_dirty = False
 
             print("\n==================== [STEP 6] INIT TRANSFORMS ====================")
             J = self.skeleton.n
@@ -151,6 +179,9 @@ class SpotRigWindow(QMainWindow):
 
             print("\n==================== [STEP 7] RENDER ====================")
             self.update_viewport_full()
+            if self.toolbar:
+                self.toolbar.set_joint_names(self.joint_names)
+                self.toolbar.set_compile_mode(self.compile_mode)
             self._notify(f"Spot(glb) loaded: {self.skeleton.n} joints, {self.mesh.n_vertices} vertices")
         except Exception as e:  # noqa: BLE001
             print("Load failed:", e)
@@ -175,12 +206,34 @@ class SpotRigWindow(QMainWindow):
         self.update_viewport_deformed()
         self._notify(f"Switched skinning mode to: {mode}")
 
+    def set_compile_mode(self, enabled: bool) -> None:
+        self.compile_mode = bool(enabled)
+        if self.compile_mode:
+            if self.timeline:
+                self.timeline.stop_playback()
+            if self.joint_transforms is not None:
+                self.joint_transforms[:] = np.eye(4, dtype=np.float32)
+            self._notify("Compile mode enabled: mesh stays static.")
+        else:
+            if self.weights_dirty:
+                self._notify("Compile mode disabled. Weights may be stale; recompute.")
+        if self.toolbar:
+            self.toolbar.set_compile_mode(self.compile_mode)
+        self.update_viewport_full()
+
     # --------------------------------------------------------------- Geometry
 
     def compute_deformed_vertices(self):
+        if self.compile_mode:
+            return self.mesh.vertices
+        if self.weights is None or self.simple_weights is None:
+            return self.mesh.vertices
         pose = [self.joint_transforms[j] for j in range(self.skeleton.n)]
         M_skin = self.skeleton.skinning_matrices(pose)
-        weights = self.simple_weights if self.skinning_mode == "simple" else self.weights
+        if self.skinning_mode == "simple":
+            weights = self.simple_weights_topk or self.simple_weights
+        else:
+            weights = self.weights_topk or self.weights
         return linear_blend_skinning(
             self.mesh.vertices,
             weights,
@@ -190,13 +243,17 @@ class SpotRigWindow(QMainWindow):
         )
 
     def compute_current_global_mats(self):
+        if self.compile_mode:
+            bind_locals = [j.bind_local for j in self.skeleton.joints]
+            return self.skeleton.forward_kinematics_local(bind_locals)
         pose = [self.joint_transforms[j] for j in range(self.skeleton.n)]
         return self.skeleton.forward_kinematics_pose(pose)
 
     def get_joint_children(self, joint_idx):
         children = []
-        for i, joint in enumerate(self.skeleton.joints):
-            if joint.parent == joint_idx:
+        parents = self.joint_parents or [j.parent for j in self.skeleton.joints]
+        for i, parent in enumerate(parents):
+            if parent == joint_idx:
                 children.append(i)
         return children
 
@@ -206,6 +263,160 @@ class SpotRigWindow(QMainWindow):
             self.joint_transforms[child_idx][:3, 3] += delta
             self.update_children_cascade(child_idx, delta)
 
+    def apply_joint_translation(self, joint_idx: int, delta: np.ndarray) -> None:
+        if self.compile_mode:
+            self._translate_bind_positions(joint_idx, delta)
+            return
+        self.joint_transforms[joint_idx][:3, 3] += delta
+        self.update_children_cascade(joint_idx, delta)
+
+    def _translate_bind_positions(self, joint_idx: int, delta: np.ndarray) -> None:
+        if self.bind_positions is None:
+            return
+        indices = self._collect_subtree(joint_idx)
+        self.bind_positions[indices] += delta[None, :]
+        self._rebuild_skeleton_from_bind()
+
+    def _collect_subtree(self, root_idx: int) -> list[int]:
+        out: list[int] = []
+        stack = [root_idx]
+        while stack:
+            idx = stack.pop()
+            out.append(idx)
+            for child in self.get_joint_children(idx):
+                stack.append(child)
+        return out
+
+    def _rebuild_skeleton_from_bind(self) -> None:
+        if self.bind_positions is None:
+            return
+        self.skeleton = Skeleton.from_bind_positions(
+            self.joint_names,
+            self.joint_parents,
+            self.bind_positions,
+        )
+        self.bones = [
+            (j.parent, i)
+            for i, j in enumerate(self.skeleton.joints)
+            if j.parent is not None and j.parent >= 0
+        ]
+        J = self.skeleton.n
+        self.joint_transforms = np.eye(4, dtype=np.float32)[None, :, :].repeat(J, axis=0)
+        self.initial_joint_transforms = self.joint_transforms.copy()
+        self.weights = None
+        self.simple_weights = None
+        self.weights_topk = None
+        self.simple_weights_topk = None
+        self.weights_dirty = True
+
+    # ----------------------------------------------------------- Compile UI
+
+    def add_joint(self) -> None:
+        if self.mesh is None or self.bind_positions is None:
+            self._notify("No mesh loaded; cannot add joint.")
+            return
+        mesh_min = self.mesh.vertices.min(axis=0)
+        mesh_max = self.mesh.vertices.max(axis=0)
+        mesh_center = (mesh_min + mesh_max) * 0.5
+        mesh_diag = float(np.linalg.norm(mesh_max - mesh_min))
+        offset = np.array([0.0, 0.05 * mesh_diag, 0.0], dtype=np.float32)
+
+        parent_idx = self.selected_joint if self.selected_joint is not None else -1
+        if parent_idx >= 0:
+            base_pos = self.bind_positions[parent_idx]
+        else:
+            base_pos = mesh_center
+
+        new_name = self._unique_joint_name("joint")
+        new_pos = (base_pos + offset).astype(np.float32)
+
+        self.joint_names.append(new_name)
+        self.joint_parents.append(int(parent_idx))
+        self.bind_positions = np.vstack([self.bind_positions, new_pos[None, :]])
+
+        self._rebuild_skeleton_from_bind()
+        self.selected_joint = len(self.joint_names) - 1
+        if self.toolbar:
+            self.toolbar.set_joint_names(self.joint_names)
+        self.update_viewport_full()
+        self._notify(f"Added joint [{self.selected_joint}] {new_name}.")
+
+    def reparent_selected_joint(self, parent_idx: int) -> None:
+        if self.selected_joint is None:
+            self._notify("Select a joint first.")
+            return
+        child_idx = self.selected_joint
+        if parent_idx == child_idx:
+            self._notify("Cannot set a joint as its own parent.")
+            return
+        if parent_idx >= 0 and self._is_descendant(parent_idx, child_idx):
+            self._notify("Invalid parent: would create a cycle.")
+            return
+
+        self.joint_parents[child_idx] = int(parent_idx)
+        self._rebuild_skeleton_from_bind()
+        if self.toolbar:
+            self.toolbar.set_joint_names(self.joint_names)
+        self.update_viewport_full()
+        self._notify(f"Reparented joint [{child_idx}] to {parent_idx}.")
+
+    def recompute_weights(self) -> None:
+        if self.mesh is None or self.skeleton is None:
+            self._notify("No skeleton loaded; cannot compute weights.")
+            return
+        cfg = HeatWeightsConfig(tau=0.5, topk=4, smooth_passes=1)
+        self.weights = compute_heat_weights(self.mesh, self.skeleton, cfg)
+        topk = min(int(cfg.topk or 4), self.skeleton.n)
+        self.weights_topk = make_topk_weights(self.weights, topk)
+        bind_locals = [j.bind_local for j in self.skeleton.joints]
+        G_bind = self.skeleton.forward_kinematics_local(bind_locals)
+        joint_positions_fk = G_bind[:, :3, 3]
+        self.simple_weights = compute_simple_weights(self.mesh.vertices, joint_positions_fk)
+        self.simple_weights_topk = make_topk_weights(self.simple_weights, 1)
+        self.weights_dirty = False
+        self._notify("Weights recomputed.")
+        if not self.compile_mode:
+            self.update_viewport_deformed()
+
+    def save_rig_bundle(self) -> None:
+        if self.mesh is None or self.skeleton is None:
+            self._notify("No skeleton loaded; cannot save rig.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save rig bundle",
+            "out/rigs/rig.npz",
+            "Rig Bundle (*.npz)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".npz"):
+            path = f"{path}.npz"
+        save_rig_npz(
+            path,
+            self.mesh,
+            self.skeleton,
+            self.joint_names,
+            self.joint_parents,
+        )
+        self._notify(f"Saved rig bundle: {path}")
+
+    def _unique_joint_name(self, base: str) -> str:
+        existing = set(self.joint_names)
+        idx = len(self.joint_names)
+        name = f"{base}_{idx}"
+        while name in existing:
+            idx += 1
+            name = f"{base}_{idx}"
+        return name
+
+    def _is_descendant(self, node_idx: int, ancestor_idx: int) -> bool:
+        p = node_idx
+        while p is not None and p >= 0:
+            if p == ancestor_idx:
+                return True
+            p = self.joint_parents[p]
+        return False
     # --------------------------------------------------------------- UI hooks
 
     def get_transforms(self):
@@ -229,7 +440,7 @@ class SpotRigWindow(QMainWindow):
 
 def run():
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
+    apply_style(app)
     window = SpotRigWindow()
     window.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())

@@ -18,6 +18,7 @@ Notes
 """
 
 from __future__ import annotations
+from dataclasses import dataclass
 from typing import Optional, Tuple
 import numpy as np
 
@@ -25,6 +26,37 @@ try:
     import scipy.sparse as sp
 except Exception:
     sp = None
+
+
+@dataclass(frozen=True)
+class TopKWeights:
+    """Compact per-vertex weights represented by top-k indices and values."""
+    indices: np.ndarray  # (N, K) int
+    weights: np.ndarray  # (N, K) float
+
+
+def make_topk_weights(
+    weights: np.ndarray,
+    k: int,
+    *,
+    eps: float = 1e-12,
+    normalize: bool = True,
+) -> TopKWeights:
+    """Convert dense weights to a compact top-k representation."""
+    W = np.asarray(weights, dtype=np.float32)
+    if W.ndim != 2:
+        raise ValueError("weights must be (N,J) to build top-k weights")
+    if k <= 0 or k > W.shape[1]:
+        raise ValueError("k must be in [1, J]")
+
+    idx = np.argpartition(-W, kth=k - 1, axis=1)[:, :k]
+    vals = np.take_along_axis(W, idx, axis=1)
+    if normalize:
+        row_sum = np.sum(vals, axis=1, keepdims=True)
+        row_sum[row_sum < eps] = 1.0
+        vals = vals / row_sum
+
+    return TopKWeights(indices=idx.astype(np.int32), weights=vals.astype(np.float32))
 
 
 def _ensure_homogeneous(verts: np.ndarray, dtype=np.float32) -> np.ndarray:
@@ -81,6 +113,30 @@ def _blend_matrices_sparse(weights_csr, joint_mats: np.ndarray) -> np.ndarray:
             Mi += w * joint_mats[c]
         out[i] = Mi
     return out
+
+
+def _blend_matrices_topk(
+    indices: np.ndarray,
+    weights: np.ndarray,
+    joint_mats: np.ndarray,
+) -> np.ndarray:
+    """
+    Top-k weights path (vectorized).
+    indices/weights: (N,K), joint_mats: (J,4,4) -> out: (N,4,4)
+    """
+    if indices.ndim != 2 or weights.ndim != 2:
+        raise ValueError("indices/weights must be (N,K)")
+    if indices.shape != weights.shape:
+        raise ValueError("indices and weights must have the same shape")
+    if joint_mats.ndim != 3 or joint_mats.shape[1:] != (4, 4):
+        raise ValueError("joint_mats must be (J,4,4)")
+    if indices.size == 0:
+        return np.zeros((indices.shape[0], 4, 4), dtype=joint_mats.dtype)
+    if indices.max() >= joint_mats.shape[0] or indices.min() < 0:
+        raise ValueError("indices out of range for joint_mats")
+
+    mats = joint_mats[indices]  # (N,K,4,4)
+    return np.einsum("nk,nkij->nij", weights, mats)
 
 
 def _normalize_weights_inplace(weights: np.ndarray, eps: float = 1e-12) -> None:
@@ -148,8 +204,13 @@ def linear_blend_skinning(
     # Prepare homogeneous vertices
     v_h = _ensure_homogeneous(verts, dtype=joint_mats.dtype)  # (N,4)
 
-    # Dense vs sparse handling
-    if sp is not None and sp.isspmatrix(weights):
+    # Top-k vs sparse vs dense handling
+    if isinstance(weights, TopKWeights):
+        M_blend = _blend_matrices_topk(weights.indices, weights.weights, joint_mats)
+    elif isinstance(weights, tuple) and len(weights) == 2:
+        idx, vals = weights
+        M_blend = _blend_matrices_topk(np.asarray(idx), np.asarray(vals), joint_mats)
+    elif sp is not None and sp.isspmatrix(weights):
         if not sp.isspmatrix_csr(weights):
             weights = weights.tocsr(copy=True)
         # Sparse path: assume weights already normalized by caller

@@ -1,7 +1,7 @@
 """Left side control/toolbar panel."""
 
-from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import (
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
     QComboBox,
     QGroupBox,
     QLabel,
@@ -10,95 +10,52 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from ui.compile_panel import SkeletonCompilePanel
+
 
 class RigControlPanel(QWidget):
     """Contains reset/skinning controls and embeds the timeline widget."""
 
-    def __init__(self, *, timeline_widget: QWidget, on_reset, on_skinning_change, parent=None):
+    def __init__(
+        self,
+        *,
+        timeline_widget: QWidget,
+        on_reset,
+        on_skinning_change,
+        on_toggle_compile=None,
+        on_add_joint=None,
+        on_set_parent=None,
+        on_recompute_weights=None,
+        on_save_rig=None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.timeline_widget = timeline_widget
         self.on_reset = on_reset
         self.on_skinning_change = on_skinning_change
 
         self.skinning_combo: QComboBox | None = None
+        self.compile_panel: SkeletonCompilePanel | None = None
+
+        self._compile_callbacks = {
+            "on_toggle_compile": on_toggle_compile,
+            "on_add_joint": on_add_joint,
+            "on_set_parent": on_set_parent,
+            "on_recompute_weights": on_recompute_weights,
+            "on_save_rig": on_save_rig,
+        }
         self._build_ui()
 
     # ------------------------------------------------------------------ UI
 
     def _build_ui(self):
         self.setFixedWidth(260)
-        self.setStyleSheet(
-            """
-            QWidget {
-                background-color: #f5f5f5;
-            }
-            QGroupBox {
-                font-weight: bold;
-                border: 2px solid #cccccc;
-                border-radius: 5px;
-                margin-top: 10px;
-                padding-top: 10px;
-                color: #000000;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px 0 5px;
-                color: #000000;
-            }
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                border: none;
-                padding: 8px;
-                border-radius: 4px;
-                font-size: 13px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-            QPushButton:pressed {
-                background-color: #3d8b40;
-            }
-            QPushButton#resetButton {
-                background-color: #ff9800;
-            }
-            QPushButton#resetButton:hover {
-                background-color: #e68900;
-            }
-            QComboBox {
-                padding: 5px;
-                border: 1px solid #cccccc;
-                border-radius: 3px;
-                background-color: white;
-                color: #333;
-            }
-            QComboBox::drop-down {
-                border: none;
-            }
-            QComboBox::down-arrow {
-                image: none;
-                border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-top: 6px solid #666;
-                margin-right: 8px;
-            }
-            QComboBox QAbstractItemView {
-                background-color: white;
-                color: #333;
-                selection-background-color: #4CAF50;
-                selection-color: white;
-                border: 1px solid #cccccc;
-            }
-        """
-        )
-
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(10)
 
         title = QLabel("Spot Rig Tool")
-        title.setStyleSheet("font-size: 16px; font-weight: bold; color: #333;")
+        title.setObjectName("TitleLabel")
         layout.addWidget(title)
 
         # Controls
@@ -139,6 +96,21 @@ class RigControlPanel(QWidget):
         skinning_group.setLayout(skinning_layout)
         layout.addWidget(skinning_group)
 
+        # Skeleton compile controls (optional)
+        if self._compile_callbacks["on_toggle_compile"] is not None:
+            compile_group = QGroupBox("Skeleton Compile")
+            compile_layout = QVBoxLayout()
+            self.compile_panel = SkeletonCompilePanel(
+                on_toggle_mode=self._compile_callbacks["on_toggle_compile"],
+                on_add_joint=self._compile_callbacks["on_add_joint"],
+                on_set_parent=self._compile_callbacks["on_set_parent"],
+                on_recompute_weights=self._compile_callbacks["on_recompute_weights"],
+                on_save_rig=self._compile_callbacks["on_save_rig"],
+            )
+            compile_layout.addWidget(self.compile_panel)
+            compile_group.setLayout(compile_layout)
+            layout.addWidget(compile_group)
+
         # Timeline
         anim_group = QGroupBox("Animation / Keyframes")
         anim_layout = QVBoxLayout()
@@ -149,7 +121,7 @@ class RigControlPanel(QWidget):
         layout.addStretch()
 
         info_label = QLabel("Spot Demo · Heat Weights + LBS + Keyframes")
-        info_label.setStyleSheet("font-size: 10px; color: #999;")
+        info_label.setObjectName("FooterLabel")
         info_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(info_label)
 
@@ -167,3 +139,13 @@ class RigControlPanel(QWidget):
         idx = self.skinning_combo.findData(mode)
         if idx >= 0:
             self.skinning_combo.setCurrentIndex(idx)
+
+    def set_joint_names(self, names: list[str]) -> None:
+        if self.compile_panel is None:
+            return
+        self.compile_panel.set_joint_names(names)
+
+    def set_compile_mode(self, enabled: bool) -> None:
+        if self.compile_panel is None:
+            return
+        self.compile_panel.set_compile_mode(enabled)

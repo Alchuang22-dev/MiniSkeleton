@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import time
 import numpy as np
-from PyQt5.QtCore import QEvent, QTimer, Qt
-from PyQt5.QtWidgets import QVBoxLayout, QWidget
+from PySide6.QtCore import QEvent, QTimer, Qt
+from PySide6.QtWidgets import QVBoxLayout, QWidget
 import pyvista as pv
 from pyvistaqt import QtInteractor
 import vtk
@@ -48,6 +49,8 @@ class RigViewport(QWidget):
         self.update_timer = QTimer(self)
         self.update_timer.setInterval(16)
         self.update_timer.timeout.connect(self._deferred_update)
+        self._last_update_time = 0.0
+        self._min_update_interval = 1.0 / 30.0
 
         self._camera_set = False
 
@@ -157,8 +160,7 @@ class RigViewport(QWidget):
         else:
             delta = right * dx * scale + up * dy * scale
 
-        self.controller.joint_transforms[self.controller.selected_joint][:3, 3] += delta
-        self.controller.update_children_cascade(self.controller.selected_joint, delta)
+        self.controller.apply_joint_translation(self.controller.selected_joint, delta)
 
         self.last_mouse_pos = (x, y)
         self.pending_update = True
@@ -182,6 +184,10 @@ class RigViewport(QWidget):
 
     def _deferred_update(self):
         if self.pending_update:
+            now = time.monotonic()
+            if (now - self._last_update_time) < self._min_update_interval:
+                return
+            self._last_update_time = now
             self.pending_update = False
             self.update_deformed_mesh_only()
 

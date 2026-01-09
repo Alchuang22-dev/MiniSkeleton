@@ -2,6 +2,9 @@
 import sys
 from PySide6.QtWidgets import QApplication, QMainWindow
 
+from ui.skeleton_editor import SpotRigWindow
+from ui.style import apply_style
+
 class MainWindow(QMainWindow):
     """主窗口：菜单栏、工具栏、停靠面板（骨架编辑/权重/时间线/导出）。"""
     def __init__(self):
@@ -11,6 +14,7 @@ class MainWindow(QMainWindow):
 
 def run():
     app = QApplication(sys.argv)
-    win = MainWindow()
+    apply_style(app)
+    win = SpotRigWindow()
     win.show()
     sys.exit(app.exec())

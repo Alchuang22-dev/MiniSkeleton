@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import numpy as np
-from PyQt5.QtCore import QTimer
-from PyQt5.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
 
 
 class ActionTimeline(QWidget):
