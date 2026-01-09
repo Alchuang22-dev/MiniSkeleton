@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QLabel,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -23,6 +25,9 @@ class SkeletonCompilePanel(QWidget):
         on_add_joint,
         on_set_parent,
         on_recompute_weights,
+        on_reset_bind,
+        on_optimize_quadruped,
+        on_export_skeleton,
         on_save_rig,
         parent=None,
     ) -> None:
@@ -31,6 +36,9 @@ class SkeletonCompilePanel(QWidget):
         self._on_add_joint = on_add_joint
         self._on_set_parent = on_set_parent
         self._on_recompute_weights = on_recompute_weights
+        self._on_reset_bind = on_reset_bind
+        self._on_optimize_quadruped = on_optimize_quadruped
+        self._on_export_skeleton = on_export_skeleton
         self._on_save_rig = on_save_rig
 
         self.mode_checkbox: QCheckBox | None = None
@@ -40,6 +48,8 @@ class SkeletonCompilePanel(QWidget):
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
 
         self.mode_checkbox = QCheckBox("Skeleton compile mode")
         self.mode_checkbox.toggled.connect(self._on_toggle_mode)
@@ -49,6 +59,8 @@ class SkeletonCompilePanel(QWidget):
             "Compile mode edits bind joints without deforming the mesh."
         )
         help_label.setWordWrap(True)
+        help_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        help_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         layout.addWidget(help_label)
 
         self.parent_combo = QComboBox()
@@ -66,6 +78,18 @@ class SkeletonCompilePanel(QWidget):
         btn_recompute = QPushButton("Recompute weights")
         btn_recompute.clicked.connect(self._on_recompute_weights)
         layout.addWidget(btn_recompute)
+
+        btn_reset_bind = QPushButton("Reset bind pose")
+        btn_reset_bind.clicked.connect(self._on_reset_bind)
+        layout.addWidget(btn_reset_bind)
+
+        btn_optimize = QPushButton("Optimize quadruped skeleton")
+        btn_optimize.clicked.connect(self._on_optimize_quadruped)
+        layout.addWidget(btn_optimize)
+
+        btn_export = QPushButton("Export skeleton (GLB)")
+        btn_export.clicked.connect(self._on_export_skeleton)
+        layout.addWidget(btn_export)
 
         btn_save = QPushButton("Save rig as...")
         btn_save.clicked.connect(self._on_save_rig)

@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import time
 import numpy as np
-from PySide6.QtCore import QEvent, QTimer, Qt
+from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import QVBoxLayout, QWidget
 import pyvista as pv
 from pyvistaqt import QtInteractor
 import vtk
-from vtk.util.numpy_support import numpy_to_vtk
+from vtk.util.numpy_support import numpy_to_vtk, vtk_to_numpy
 
 
 class RigViewport(QWidget):
@@ -38,6 +37,8 @@ class RigViewport(QWidget):
         self.gizmo_actors = []
         self.axis_arrows = {}
         self.label_actor = None
+        self._mesh_points = None
+        self._mesh_points_np = None
 
         # Interaction state
         self.dragging_axis = None
@@ -45,13 +46,6 @@ class RigViewport(QWidget):
         self.last_mouse_pos = None
 
         # Deferred mesh update during drag
-        self.pending_update = False
-        self.update_timer = QTimer(self)
-        self.update_timer.setInterval(16)
-        self.update_timer.timeout.connect(self._deferred_update)
-        self._last_update_time = 0.0
-        self._min_update_interval = 1.0 / 30.0
-
         self._camera_set = False
 
     # ---------------------------------------------------------------- Events
@@ -160,12 +154,8 @@ class RigViewport(QWidget):
         else:
             delta = right * dx * scale + up * dy * scale
 
-        self.controller.apply_joint_translation(self.controller.selected_joint, delta)
-
         self.last_mouse_pos = (x, y)
-        self.pending_update = True
-        if not self.update_timer.isActive():
-            self.update_timer.start()
+        self.controller.queue_joint_delta(self.controller.selected_joint, delta)
 
     def handle_mouse_release(self, event):
         if event.button() != Qt.LeftButton or not self.is_dragging:
@@ -175,21 +165,11 @@ class RigViewport(QWidget):
         self.last_mouse_pos = None
         self.plotter.enable()
 
-        self.update_timer.stop()
-        self.update_deformed_mesh_only()
+        self.controller.request_deform_update()
 
         if self.controller.selected_joint is not None:
             joint_name = self.controller.skeleton.joints[self.controller.selected_joint].name
             self._notify(f"Joint [{self.controller.selected_joint}] {joint_name} move finished")
-
-    def _deferred_update(self):
-        if self.pending_update:
-            now = time.monotonic()
-            if (now - self._last_update_time) < self._min_update_interval:
-                return
-            self._last_update_time = now
-            self.pending_update = False
-            self.update_deformed_mesh_only()
 
     # -------------------------------------------------------------- Rendering
 
@@ -223,6 +203,10 @@ class RigViewport(QWidget):
             smooth_shading=True,
             pickable=False,
         )
+        vtk_points = self.mesh_actor.GetMapper().GetInput().GetPoints()
+        vtk_array = vtk_points.GetData()
+        self._mesh_points = vtk_points
+        self._mesh_points_np = vtk_to_numpy(vtk_array)
 
         for jp, jc in self.controller.bones:
             p1 = current_joint_positions[jp]
@@ -266,15 +250,25 @@ class RigViewport(QWidget):
 
         self.plotter.update()
 
-    def update_deformed_mesh_only(self):
+    def update_deformed_mesh_only(self, vertices: np.ndarray | None = None):
         if self.mesh_actor is None:
             return
 
-        deformed_vertices = self.controller.compute_deformed_vertices()
-        vtk_points = self.mesh_actor.GetMapper().GetInput().GetPoints()
-        vtk_array = numpy_to_vtk(deformed_vertices, deep=True)
-        vtk_points.SetData(vtk_array)
-        vtk_points.Modified()
+        deformed_vertices = vertices if vertices is not None else self.controller.compute_deformed_vertices()
+        if (
+            self._mesh_points_np is None
+            or self._mesh_points_np.shape != deformed_vertices.shape
+            or self._mesh_points is None
+        ):
+            vtk_points = self.mesh_actor.GetMapper().GetInput().GetPoints()
+            vtk_array = numpy_to_vtk(deformed_vertices, deep=True)
+            vtk_points.SetData(vtk_array)
+            vtk_points.Modified()
+            self._mesh_points = vtk_points
+            self._mesh_points_np = vtk_to_numpy(vtk_array)
+        else:
+            self._mesh_points_np[:] = deformed_vertices
+            self._mesh_points.Modified()
 
         G_current = self.controller.compute_current_global_mats()
         current_joint_positions = G_current[:, :3, 3]

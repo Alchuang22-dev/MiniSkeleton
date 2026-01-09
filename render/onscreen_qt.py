@@ -65,6 +65,9 @@ class SceneRenderer:
         self._vbo = None
         self._ibo = None
         self._vao = None
+        self._vbo_array = None
+        self._vertex_capacity = 0
+        self._index_capacity = 0
 
         self.scene: Optional[Scene] = None
         self.current_time: float = 0.0
@@ -180,15 +183,36 @@ class SceneRenderer:
 
         normals = self._compute_vertex_normals(vertices, faces)
 
-        # 组装 buffer
+        # 组装/复用 buffer
         v = np.asarray(vertices, dtype=np.float32)
         n = np.asarray(normals, dtype=np.float32)
-        vbo_data = np.hstack([v, n]).astype("f4").tobytes()
-        self._vbo = self.ctx.buffer(vbo_data)
-        self._ibo = self.ctx.buffer(faces.astype("i4").tobytes())
+        v_count = v.shape[0]
+        idx_count = int(faces.size)
 
-        vao_content = [(self._vbo, "3f 3f", "in_position", "in_normal")]
-        self._vao = self.ctx.vertex_array(self.prog, vao_content, self._ibo)
+        if self._vbo is None or self._vertex_capacity < v_count:
+            self._vertex_capacity = v_count
+            self._vbo_array = np.empty((v_count, 6), dtype=np.float32)
+            self._vbo = self.ctx.buffer(reserve=self._vbo_array.nbytes)
+            self._vao = None
+        elif self._vbo_array is None or self._vbo_array.shape[0] != v_count:
+            self._vbo_array = np.empty((v_count, 6), dtype=np.float32)
+
+        faces_bytes = faces.astype("i4").tobytes()
+        if self._ibo is None or self._index_capacity != idx_count:
+            self._index_capacity = idx_count
+            self._ibo = self.ctx.buffer(reserve=len(faces_bytes))
+            self._ibo.write(faces_bytes)
+            self._vao = None
+        else:
+            self._ibo.write(faces_bytes)
+
+        self._vbo_array[:, :3] = v
+        self._vbo_array[:, 3:] = n
+        self._vbo.write(self._vbo_array.tobytes())
+
+        if self._vao is None:
+            vao_content = [(self._vbo, "3f 3f", "in_position", "in_normal")]
+            self._vao = self.ctx.vertex_array(self.prog, vao_content, self._ibo)
 
         # 计算 MVP
         cam = self.camera
