@@ -19,6 +19,7 @@ class ActionTimeline(QWidget):
         set_transforms,
         on_update_mesh,
         on_status,
+        on_generate_demo=None,
         parent=None,
     ):
         super().__init__(parent)
@@ -26,6 +27,7 @@ class ActionTimeline(QWidget):
         self.set_transforms = set_transforms
         self.on_update_mesh = on_update_mesh
         self.on_status = on_status
+        self.on_generate_demo = on_generate_demo
 
         self.keyframes: list[np.ndarray] = []
         self.current_frame_index: int = -1
@@ -48,6 +50,11 @@ class ActionTimeline(QWidget):
         btn_record = QPushButton("Record keyframe")
         btn_record.clicked.connect(self.record_keyframe)
         layout.addWidget(btn_record)
+
+        if self.on_generate_demo is not None:
+            btn_demo = QPushButton("Auto head shake")
+            btn_demo.clicked.connect(self._generate_demo_keyframes)
+            layout.addWidget(btn_demo)
 
         btn_clear = QPushButton("Clear keyframes")
         btn_clear.clicked.connect(self.clear_keyframes)
@@ -81,6 +88,25 @@ class ActionTimeline(QWidget):
         self.current_frame_index = -1
         self._notify("Cleared all keyframes.")
         self._refresh_status()
+
+    def set_keyframes(self, keyframes: list[np.ndarray], *, current_index: int = 0) -> None:
+        self.stop_playback()
+        self.keyframes = [np.array(kf, copy=True) for kf in keyframes]
+        if self.keyframes:
+            self.current_frame_index = max(0, min(int(current_index), len(self.keyframes) - 1))
+        else:
+            self.current_frame_index = -1
+        self._refresh_status()
+
+    def _generate_demo_keyframes(self):
+        if self.on_generate_demo is None:
+            return
+        keyframes = self.on_generate_demo()
+        if not keyframes:
+            self._notify("Demo keyframes generation failed.")
+            return
+        self.set_keyframes(keyframes, current_index=0)
+        self._notify(f"Generated {len(keyframes)} demo keyframes.")
 
     def toggle_playback(self):
         if not self.is_playing:

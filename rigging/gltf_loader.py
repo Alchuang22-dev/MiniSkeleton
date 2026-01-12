@@ -1,7 +1,7 @@
 # rigging/gltf_loader.py
 # -*- coding: utf-8 -*-
 """
-Minimal glTF/GLB mesh + skeleton loader for Spot.
+Minimal glTF/GLB mesh + skeleton loader (generic).
 
 功能：
 - 从 .glb/.gltf 中读取第一个 skin 的关节列表
@@ -77,10 +77,17 @@ def _load_accessor(gltf: GLTF2, accessor_id: int) -> np.ndarray:
     raw_slice = raw_buf[base_offset: base_offset + byte_len]
     arr = np.frombuffer(raw_slice, dtype=dt)
 
+    # normalized accessor: convert integer data to float range
+    normalized = bool(getattr(acc, "normalized", False))
+    if normalized and np.issubdtype(arr.dtype, np.integer):
+        max_val = float(np.iinfo(arr.dtype).max)
+        if max_val > 0:
+            arr = arr.astype(np.float32) / max_val
+
     # 整理形状
     if acc.type == "SCALAR":
         # indices: 统一转为 int32
-        return arr.astype(np.int32)
+        return arr.astype(np.float32 if normalized else np.int32)
     elif acc.type == "VEC3":
         return arr.reshape(-1, 3)
     elif acc.type == "VEC4":
@@ -94,12 +101,56 @@ def _load_accessor(gltf: GLTF2, accessor_id: int) -> np.ndarray:
 
 # ------------------ transform helpers ------------------ #
 
+def _build_dense_skin_weights(joints: np.ndarray, weights: np.ndarray, joint_count: int) -> np.ndarray:
+    """
+    Convert JOINTS_0/WEIGHTS_0 (N,4) into dense (N,J) weights.
+    """
+    joints = np.asarray(joints, dtype=np.int32)
+    weights = np.asarray(weights, dtype=np.float32)
+    if joints.shape != weights.shape:
+        raise ValueError("JOINTS_0 and WEIGHTS_0 must have the same shape")
+    if joints.ndim != 2 or joints.shape[1] != 4:
+        raise ValueError("JOINTS_0/WEIGHTS_0 must be (N,4)")
+
+    n = joints.shape[0]
+    dense = np.zeros((n, joint_count), dtype=np.float32)
+    rows = np.repeat(np.arange(n, dtype=np.int32), 4)
+    cols = joints.reshape(-1)
+    vals = weights.reshape(-1)
+    valid = (cols >= 0) & (cols < joint_count) & (vals > 0)
+    if np.any(valid):
+        np.add.at(dense, (rows[valid], cols[valid]), vals[valid])
+    row_sum = dense.sum(axis=1, keepdims=True)
+    row_sum[row_sum == 0] = 1.0
+    dense /= row_sum
+    return dense
+
+def _principal_axes(points: np.ndarray) -> np.ndarray:
+    """Return PCA axes (3x3) for points (N,3)."""
+    pts = np.asarray(points, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] != 3 or pts.shape[0] < 3:
+        return np.eye(3, dtype=np.float32)
+    centered = pts - np.mean(pts, axis=0, keepdims=True)
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    axes = vh[:3]
+    # normalize
+    norms = np.linalg.norm(axes, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return (axes / norms).astype(np.float32)
+
+def _axes_alignment_score(mesh_axes: np.ndarray, joint_axes: np.ndarray) -> float:
+    """Higher score means closer axis alignment (ignores sign flips)."""
+    score = 0.0
+    for i in range(3):
+        score += float(abs(np.dot(mesh_axes[i], joint_axes[i])))
+    return score
+
 def _node_local_matrix(node) -> np.ndarray:
     """把 glTF 的 node (matrix / TRS) 转成 4x4 局部矩阵."""
     M = np.eye(4, dtype=np.float32)
 
     if node.matrix:
-        M[:] = np.array(node.matrix, dtype=np.float32).reshape(4, 4)
+        M[:] = np.array(node.matrix, dtype=np.float32).reshape(4, 4).T
         return M
 
     # TRS 形式
@@ -166,6 +217,13 @@ def _compute_node_globals(gltf: GLTF2) -> np.ndarray:
     return global_mats
 
 
+def _apply_mesh_transform(mats: np.ndarray, mesh_mat: np.ndarray) -> np.ndarray:
+    out = np.zeros_like(mats, dtype=np.float32)
+    for i in range(mats.shape[0]):
+        out[i] = mesh_mat @ mats[i]
+    return out
+
+
 # 统一坐标系旋转（绕 X 轴 -90°）：x'=x, y'=-z, z'=y
 _ROT_X_NEG_90 = np.array(
     [
@@ -180,7 +238,12 @@ _ROT_X_NEG_90 = np.array(
 
 # ------------------ public loaders ------------------ #
 
-def load_mesh_and_skeleton_from_glb(path: str):
+def load_mesh_and_skeleton_from_glb(
+    path: str,
+    *,
+    return_bind_mats: bool = False,
+    return_weights: bool = False,
+):
     """
     从 GLB 读取 mesh + skeleton（优先使用 IBM，异常时自动回退到 node global）。
     返回:
@@ -199,6 +262,13 @@ def load_mesh_and_skeleton_from_glb(path: str):
         raise RuntimeError(f"GLB '{path}' has no skins (skeleton)")
 
     skin_index = 0
+    skin_usage = {i: 0 for i in range(len(gltf.skins))}
+    for node in gltf.nodes:
+        if node.mesh is not None and node.skin is not None:
+            if node.skin in skin_usage:
+                skin_usage[node.skin] += 1
+    if skin_usage:
+        skin_index = max(skin_usage, key=skin_usage.get)
     skin = gltf.skins[skin_index]
     joint_nodes = skin.joints
     J = len(joint_nodes)
@@ -206,6 +276,12 @@ def load_mesh_and_skeleton_from_glb(path: str):
 
     # ---------- 1) 所有 node 的 global 矩阵 ----------
     node_globals = _compute_node_globals(gltf)  # (N,4,4)
+    node_parents = np.full(len(gltf.nodes), -1, dtype=np.int32)
+    for pid, parent in enumerate(gltf.nodes):
+        if not parent.children:
+            continue
+        for cid in parent.children:
+            node_parents[cid] = pid
 
     # ---------- 2) mesh_nodes: 收集所有使用该 skin 的 mesh node ----------
     mesh_nodes: List[int] = []
@@ -228,6 +304,9 @@ def load_mesh_and_skeleton_from_glb(path: str):
     # ---------- 3) 合并所有 mesh primitive，计算 mesh AABB ----------
     vertices_list = []
     faces_list = []
+    joints_list = []
+    weights_list = []
+    missing_weights = False
     vert_offset = 0
 
     for mesh_node_index in mesh_nodes:
@@ -252,6 +331,20 @@ def load_mesh_and_skeleton_from_glb(path: str):
             )  # (n,4)
             pos_world = (M_mesh @ homo.T).T[:, :3]  # (n,3)
 
+            if return_weights:
+                joints_accessor_index = getattr(attrs, "JOINTS_0", None)
+                weights_accessor_index = getattr(attrs, "WEIGHTS_0", None)
+                if joints_accessor_index is None or weights_accessor_index is None:
+                    missing_weights = True
+                else:
+                    joints = _load_accessor(gltf, joints_accessor_index).astype(np.int32)
+                    weights = _load_accessor(gltf, weights_accessor_index).astype(np.float32)
+                    if joints.shape[0] != pos_world.shape[0] or weights.shape[0] != pos_world.shape[0]:
+                        missing_weights = True
+                    else:
+                        joints_list.append(joints)
+                        weights_list.append(weights)
+
             if prim.indices is not None:
                 faces_flat = _load_accessor(gltf, prim.indices).astype(np.int32)
                 faces = faces_flat.reshape(-1, 3) + vert_offset
@@ -268,6 +361,19 @@ def load_mesh_and_skeleton_from_glb(path: str):
 
     vertices = np.concatenate(vertices_list, axis=0).astype(np.float32)
     faces = np.concatenate(faces_list, axis=0).astype(np.int32)
+
+    skin_weights = None
+    if return_weights:
+        if missing_weights or not joints_list or len(joints_list) != len(vertices_list):
+            print("  \u26a0\ufe0f skin weights missing or incomplete; falling back to computed weights.")
+        else:
+            joints = np.concatenate(joints_list, axis=0)
+            weights = np.concatenate(weights_list, axis=0)
+            try:
+                skin_weights = _build_dense_skin_weights(joints, weights, J)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  \u26a0\ufe0f Failed to build skin weights from GLB: {exc}")
+                skin_weights = None
 
     vmin = vertices.min(axis=0)
     vmax = vertices.max(axis=0)
@@ -289,14 +395,12 @@ def load_mesh_and_skeleton_from_glb(path: str):
     node_to_joint = {nid: j for j, nid in enumerate(joint_nodes)}
     parents = np.full(J, -1, dtype=np.int32)
 
-    for parent_node_id, parent_node in enumerate(gltf.nodes):
-        if not parent_node.children:
-            continue
-        for child_id in parent_node.children:
-            if child_id in node_to_joint and parent_node_id in node_to_joint:
-                c = node_to_joint[child_id]
-                p = node_to_joint[parent_node_id]
-                parents[c] = p
+    for j, nid in enumerate(joint_nodes):
+        p = int(node_parents[nid])
+        while p >= 0 and p not in node_to_joint:
+            p = int(node_parents[p])
+        if p in node_to_joint:
+            parents[j] = int(node_to_joint[p])
 
     print(f"  ▶ parents (前10): {parents[:10]}")
 
@@ -345,20 +449,26 @@ def load_mesh_and_skeleton_from_glb(path: str):
         print(f"  ▶ candidate A (IBM) joint center: {center_A}")
         print(f"    A - mesh center: {center_A - vcenter}")
 
-    # ---------- 6) 选哪一套关节矩阵？ ----------
-    if use_IBM and center_A is not None:
-        dist_A = np.linalg.norm(center_A - vcenter)
-        dist_B = np.linalg.norm(center_B - vcenter)
-        print(f"  ▶ dist_A(IBM)={dist_A:.6f}, dist_B(nodes)={dist_B:.6f}")
-
-        if np.isfinite(dist_A) and dist_A < 3.0 * dist_B:
-            print("  ✅ 使用 IBM 推导的关节矩阵 (candidate A)")
+    # ---------- 6) select joint globals ----------
+    joint_globals = None
+    if use_IBM and G_A is not None and np.all(np.isfinite(G_A)):
+        mesh_axes = _principal_axes(vertices)
+        axes_A = _principal_axes(pos_A)
+        axes_B = _principal_axes(pos_B)
+        score_A = _axes_alignment_score(mesh_axes, axes_A)
+        score_B = _axes_alignment_score(mesh_axes, axes_B)
+        print(f"  [INFO] axis alignment score: A={score_A:.3f}, B={score_B:.3f}")
+        if score_A + 0.05 >= score_B:
+            print("  [OK] use IBM-derived bind matrices (candidate A)")
             joint_globals = G_A
         else:
-            print("  ⚠️ IBM 推导结果看起来异常，回退到 node_globals (candidate B)")
+            print("  [INFO] use node_globals (candidate B)")
             joint_globals = G_B
+    elif use_IBM and G_A is not None:
+        print("  [WARN] IBM contains invalid values; fallback to node_globals (candidate B)")
+        joint_globals = G_B
     else:
-        print("  ▶ 没有 IBM 或 IBM 读取失败，使用 node_globals (candidate B)")
+        print("  [INFO] use node_globals (candidate B)")
         joint_globals = G_B
 
     positions = joint_globals[:, :3, 3].astype(np.float32)
@@ -366,7 +476,12 @@ def load_mesh_and_skeleton_from_glb(path: str):
     print(f"  ▶ 最终 joint center: {center_final}")
     print(f"    final - mesh center: {center_final - vcenter}")
 
-    return vertices, faces, names, parents, positions
+    outputs = [vertices, faces, names, parents, positions]
+    if return_bind_mats:
+        outputs.append(joint_globals)
+    if return_weights:
+        outputs.append(skin_weights)
+    return tuple(outputs)
 
 
 def load_skeleton_from_glb(path: str):

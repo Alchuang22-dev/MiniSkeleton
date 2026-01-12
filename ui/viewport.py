@@ -44,7 +44,6 @@ class RigViewport(QWidget):
         self.dragging_axis = None
         self.is_dragging = False
         self.last_mouse_pos = None
-
         # Deferred mesh update during drag
         self._camera_set = False
 
@@ -74,15 +73,13 @@ class RigViewport(QWidget):
         mouse_x_scaled = mouse_x * dpr
         mouse_y_scaled = mouse_y * dpr
         window_height = window_size[1]
+        mouse_y_vtk = window_height - mouse_y_scaled
 
-        self.picker.Pick(mouse_x_scaled, window_height - mouse_y_scaled, 0, self.plotter.renderer)
+        self.picker.Pick(mouse_x_scaled, mouse_y_vtk, 0, self.plotter.renderer)
         picked_actor = self.picker.GetActor()
 
         if picked_actor is None:
-            self.controller.selected_joint = None
-            self.update_gizmo_only()
-            self._notify("Click red sphere to select a joint.")
-            return
+            picked_actor = None
 
         # 1) drag gizmo axis
         if picked_actor in self.axis_arrows:
@@ -94,20 +91,41 @@ class RigViewport(QWidget):
             self._notify(f"Start dragging {axis_name.upper()} axis")
             return
 
-        # 2) pick joint sphere
-        for sphere_actor, joint_idx in self.joint_sphere_actors.items():
-            if sphere_actor == picked_actor:
-                if self.controller.selected_joint == joint_idx:
-                    self.is_dragging = True
-                    self.last_mouse_pos = (mouse_x, mouse_y)
-                    self.plotter.disable()
-                    self._notify(f"Dragging joint [{joint_idx}]")
-                else:
-                    self.controller.selected_joint = joint_idx
-                    self.update_gizmo_only()
-                    joint_name = self.controller.skeleton.joints[joint_idx].name
-                    self._notify(f"Selected joint [{joint_idx}] {joint_name}")
+        # 2) pick joint by screen-space proximity (supports overlap cycling)
+        radius_px = 12.0 * dpr
+        candidates = self._pick_joint_candidates(mouse_x_scaled, mouse_y_vtk, radius_px)
+        if candidates:
+            if (
+                self.controller.selected_joint in candidates
+                and not (event.modifiers() & Qt.ShiftModifier)
+            ):
+                self.is_dragging = True
+                self.last_mouse_pos = (mouse_x, mouse_y)
+                self.plotter.disable()
+                self._notify(f"Dragging joint [{self.controller.selected_joint}]")
                 return
+
+            if (
+                event.modifiers() & Qt.ShiftModifier
+                and self.controller.selected_joint in candidates
+                and len(candidates) > 1
+            ):
+                current_idx = candidates.index(self.controller.selected_joint)
+                joint_idx = candidates[(current_idx + 1) % len(candidates)]
+            else:
+                joint_idx = candidates[0]
+
+            self.controller.selected_joint = joint_idx
+            self.update_gizmo_only()
+            joint_name = self.controller.skeleton.joints[joint_idx].name
+            if len(candidates) > 1:
+                self._notify(
+                    f"Selected joint [{joint_idx}] {joint_name} "
+                    f"(Shift-click to cycle {len(candidates)} overlaps)."
+                )
+            else:
+                self._notify(f"Selected joint [{joint_idx}] {joint_name}")
+            return
 
         # 3) click other actor -> deselect
         self.controller.selected_joint = None
@@ -362,3 +380,27 @@ class RigViewport(QWidget):
     def _notify(self, msg: str):
         if self.on_status:
             self.on_status(msg)
+
+    def _pick_joint_candidates(
+        self,
+        mouse_x_vtk: float,
+        mouse_y_vtk: float,
+        radius_px: float,
+    ) -> list[int]:
+        if self.controller.skeleton is None:
+            return []
+        renderer = self.plotter.renderer
+        G_current = self.controller.compute_current_global_mats()
+        joint_positions = G_current[:, :3, 3]
+        matches: list[tuple[int, float]] = []
+        for idx, pos in enumerate(joint_positions):
+            renderer.SetWorldPoint(float(pos[0]), float(pos[1]), float(pos[2]), 1.0)
+            renderer.WorldToDisplay()
+            sx, sy, _ = renderer.GetDisplayPoint()
+            dx = sx - mouse_x_vtk
+            dy = sy - mouse_y_vtk
+            dist = (dx * dx + dy * dy) ** 0.5
+            if dist <= radius_px:
+                matches.append((idx, dist))
+        matches.sort(key=lambda it: it[1])
+        return [idx for idx, _ in matches]

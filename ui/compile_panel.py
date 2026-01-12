@@ -24,6 +24,7 @@ class SkeletonCompilePanel(QWidget):
         on_toggle_mode,
         on_add_joint,
         on_set_parent,
+        on_clear_parent,
         on_recompute_weights,
         on_reset_bind,
         on_optimize_quadruped,
@@ -35,6 +36,7 @@ class SkeletonCompilePanel(QWidget):
         self._on_toggle_mode = on_toggle_mode
         self._on_add_joint = on_add_joint
         self._on_set_parent = on_set_parent
+        self._on_clear_parent = on_clear_parent
         self._on_recompute_weights = on_recompute_weights
         self._on_reset_bind = on_reset_bind
         self._on_optimize_quadruped = on_optimize_quadruped
@@ -63,6 +65,12 @@ class SkeletonCompilePanel(QWidget):
         help_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         layout.addWidget(help_label)
 
+        pick_label = QLabel("Tip: Shift-click overlapping joints to cycle selection.")
+        pick_label.setWordWrap(True)
+        pick_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        pick_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        layout.addWidget(pick_label)
+
         self.parent_combo = QComboBox()
         self.parent_combo.addItem("<Root>", -1)
         layout.addWidget(self.parent_combo)
@@ -70,6 +78,10 @@ class SkeletonCompilePanel(QWidget):
         btn_set_parent = QPushButton("Set parent for selected")
         btn_set_parent.clicked.connect(self._emit_set_parent)
         layout.addWidget(btn_set_parent)
+
+        btn_clear_parent = QPushButton("Clear parent (to root)")
+        btn_clear_parent.clicked.connect(self._emit_clear_parent)
+        layout.addWidget(btn_clear_parent)
 
         btn_add_joint = QPushButton("Add joint (child of selected)")
         btn_add_joint.clicked.connect(self._on_add_joint)
@@ -104,6 +116,11 @@ class SkeletonCompilePanel(QWidget):
         if parent_idx is None:
             return
         self._on_set_parent(int(parent_idx))
+
+    def _emit_clear_parent(self) -> None:
+        if self._on_clear_parent is None:
+            return
+        self._on_clear_parent()
 
     def set_joint_names(self, names: list[str]) -> None:
         if self.parent_combo is None:

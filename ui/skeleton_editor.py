@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import numpy as np
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
@@ -16,12 +17,14 @@ from PySide6.QtWidgets import (
 
 from rigging.mesh_io import Mesh
 from rigging.gltf_loader import load_mesh_and_skeleton_from_glb
-from rigging.skeleton import Skeleton
+from rigging.skeleton import Skeleton, euler_xyz_to_rot
 from rigging.lbs import linear_blend_skinning, make_topk_weights
 from rigging.weights_heat import HeatWeightsConfig, compute_heat_weights
 from rigging.rig_io import save_rig_npz
 from rigging.skeleton_optimize import optimize_quadruped_bind_positions
 from rigging.gltf_export import export_skeleton_glb as gltf_export_skeleton
+from render.offscreen_vtk import OffscreenVtkRenderer
+from tools.export_video import frames_to_video
 
 from ui.action_timeline import ActionTimeline
 from ui.compute_worker import DeformWorker, WeightsWorker
@@ -29,6 +32,24 @@ from ui.export_panel import RigControlPanel
 from ui.viewport import RigViewport
 from ui.weight_tools import compute_simple_weights
 from ui.style import apply_style
+
+
+DEMO_FPS = 30
+DEMO_DURATION = 1.5
+DEMO_HEAD_YAW = 0.35
+DEMO_NECK_YAW = 0.15
+RENDER_YAW_DEG = -90.0
+
+
+def _rotation_y(angle_rad: float) -> np.ndarray:
+    R = euler_xyz_to_rot(0.0, float(angle_rad), 0.0)
+    return R.astype(np.float32)
+
+
+def _apply_local_rotation(base: np.ndarray, R: np.ndarray) -> np.ndarray:
+    out = np.array(base, copy=True)
+    out[:3, :3] = R @ out[:3, :3]
+    return out
 
 
 class SpotRigWindow(QMainWindow):
@@ -47,9 +68,11 @@ class SpotRigWindow(QMainWindow):
         self.joint_names: list[str] = []
         self.joint_parents: list[int] = []
         self.bind_positions: np.ndarray | None = None
+        self._bind_locals: list[np.ndarray] | None = None
         self._orig_joint_names: list[str] = []
         self._orig_joint_parents: list[int] = []
         self._orig_bind_positions: np.ndarray | None = None
+        self._orig_bind_locals: list[np.ndarray] | None = None
         self.weights = None
         self.simple_weights = None
         self.weights_topk = None
@@ -103,6 +126,7 @@ class SpotRigWindow(QMainWindow):
             set_transforms=self.set_transforms,
             on_update_mesh=self.request_deform_update,
             on_status=self._notify,
+            on_generate_demo=self.generate_demo_keyframes,
         )
         self.toolbar = RigControlPanel(
             timeline_widget=self.timeline,
@@ -112,10 +136,13 @@ class SpotRigWindow(QMainWindow):
             on_toggle_compile=self.set_compile_mode,
             on_add_joint=self.add_joint,
             on_set_parent=self.reparent_selected_joint,
+            on_clear_parent=self.clear_parent_selected_joint,
             on_recompute_weights=self.recompute_weights,
             on_reset_bind=self.reset_bind_pose,
             on_optimize_quadruped=self.optimize_quadruped_skeleton,
             on_export_skeleton=self.export_skeleton_glb,
+            on_render_frames=self.render_frames_vtk,
+            on_make_video=self.make_video_from_frames,
             on_save_rig=self.save_rig_bundle,
         )
         self.viewport = RigViewport(self, self._notify)
@@ -165,7 +192,19 @@ class SpotRigWindow(QMainWindow):
             print("\n==================== [STEP 1] LOAD MESH + SKELETON FROM GLB ====================")
             print(f"[INFO] Loading mesh + skeleton from: {glb_path}")
 
-            verts, faces, names, parents, joint_positions = load_mesh_and_skeleton_from_glb(glb_path)
+            (
+                verts,
+                faces,
+                names,
+                parents,
+                joint_positions,
+                bind_mats,
+                skin_weights,
+            ) = load_mesh_and_skeleton_from_glb(
+                glb_path,
+                return_bind_mats=True,
+                return_weights=True,
+            )
             print(f"  - glb vertices: {verts.shape}")
             print(f"  - glb faces   : {faces.shape}")
 
@@ -183,8 +222,13 @@ class SpotRigWindow(QMainWindow):
             print(f"  - mesh scale   : {mesh_scale}")
 
             print("\n==================== [STEP 2] BUILD SKELETON ====================")
-            self.skeleton = Skeleton.from_bind_positions(names, parents, joint_positions)
+            if bind_mats is not None:
+                self.skeleton = Skeleton.from_bind_matrices(names, parents, bind_mats)
+            else:
+                self.skeleton = Skeleton.from_bind_positions(names, parents, joint_positions)
             print(f"  - Skeleton joints: {self.skeleton.n}")
+            self._bind_locals = [np.array(j.bind_local, copy=True) for j in self.skeleton.joints]
+            self._orig_bind_locals = [np.array(j.bind_local, copy=True) for j in self.skeleton.joints]
             self.joint_names = list(names)
             self.joint_parents = [int(p) for p in parents]
             self.bind_positions = np.array(joint_positions, dtype=np.float32, copy=True)
@@ -208,13 +252,20 @@ class SpotRigWindow(QMainWindow):
             print(f"  - FK joint center: {fk_center}")
             print(f"  - FK - mesh center: {fk_center - mesh_center}")
 
-            print("\n==================== [STEP 4] HEAT WEIGHTS ====================")
-            cfg = HeatWeightsConfig(tau=0.5, topk=4, smooth_passes=1)
-            print("[INFO] Computing heat weights (Pinocchio style)...")
-            self.weights = compute_heat_weights(self.mesh, self.skeleton, cfg)
-            print("  - Heat weights shape:", self.weights.shape)
-            topk = min(int(cfg.topk or 4), self.skeleton.n)
-            self.weights_topk = make_topk_weights(self.weights, topk)
+            print("\n==================== [STEP 4] WEIGHTS ====================")
+            if skin_weights is not None:
+                self.weights = skin_weights
+                topk = min(4, self.skeleton.n)
+                self.weights_topk = make_topk_weights(self.weights, topk)
+                self.weights_dirty = False
+                print("  - Using GLB skin weights")
+            else:
+                cfg = HeatWeightsConfig(tau=0.5, topk=4, smooth_passes=1)
+                print("[INFO] Computing heat weights (Pinocchio style)...")
+                self.weights = compute_heat_weights(self.mesh, self.skeleton, cfg)
+                print("  - Heat weights shape:", self.weights.shape)
+                topk = min(int(cfg.topk or 4), self.skeleton.n)
+                self.weights_topk = make_topk_weights(self.weights, topk)
 
             print("\n==================== [STEP 5] SIMPLE WEIGHTS ====================")
             joint_positions_fk = G_bind[:, :3, 3]
@@ -237,6 +288,11 @@ class SpotRigWindow(QMainWindow):
                 self.toolbar.set_joint_names(self.joint_names)
                 self.toolbar.set_compile_mode(self.compile_mode)
                 self.toolbar.set_model_path(glb_path)
+                base = os.path.splitext(os.path.basename(glb_path))[0]
+                self.toolbar.set_video_paths(
+                    os.path.join("out", "frames", base),
+                    os.path.join("out", "videos", f"{base}.mp4"),
+                )
             self._notify(f"Spot(glb) loaded: {self.skeleton.n} joints, {self.mesh.n_vertices} vertices")
         except Exception as e:  # noqa: BLE001
             print("Load failed:", e)
@@ -358,11 +414,47 @@ class SpotRigWindow(QMainWindow):
     def _rebuild_skeleton_from_bind(self) -> None:
         if self.bind_positions is None:
             return
-        self.skeleton = Skeleton.from_bind_positions(
-            self.joint_names,
-            self.joint_parents,
-            self.bind_positions,
-        )
+        J = len(self.joint_names)
+        if self._bind_locals is not None:
+            if len(self._bind_locals) < J:
+                missing = J - len(self._bind_locals)
+                self._bind_locals.extend([np.eye(4, dtype=np.float32) for _ in range(missing)])
+            elif len(self._bind_locals) > J:
+                self._bind_locals = self._bind_locals[:J]
+
+        if self._bind_locals is not None and len(self._bind_locals) == J:
+            bind_locals = []
+            for j in range(J):
+                rot = self._bind_locals[j][:3, :3]
+                if self.joint_parents[j] < 0:
+                    t = self.bind_positions[j]
+                else:
+                    t = self.bind_positions[j] - self.bind_positions[self.joint_parents[j]]
+                mat = np.eye(4, dtype=np.float32)
+                mat[:3, :3] = rot
+                mat[:3, 3] = t
+                bind_locals.append(mat)
+
+            bind_globals = np.zeros((J, 4, 4), dtype=np.float32)
+            for j in range(J):
+                p = self.joint_parents[j]
+                if p < 0:
+                    bind_globals[j] = bind_locals[j]
+                else:
+                    bind_globals[j] = bind_globals[p] @ bind_locals[j]
+
+            self.skeleton = Skeleton.from_bind_matrices(
+                self.joint_names,
+                self.joint_parents,
+                bind_globals,
+            )
+            self._bind_locals = bind_locals
+        else:
+            self.skeleton = Skeleton.from_bind_positions(
+                self.joint_names,
+                self.joint_parents,
+                self.bind_positions,
+            )
         self.bones = [
             (j.parent, i)
             for i, j in enumerate(self.skeleton.joints)
@@ -401,6 +493,8 @@ class SpotRigWindow(QMainWindow):
         self.joint_names.append(new_name)
         self.joint_parents.append(int(parent_idx))
         self.bind_positions = np.vstack([self.bind_positions, new_pos[None, :]])
+        if self._bind_locals is not None:
+            self._bind_locals.append(np.eye(4, dtype=np.float32))
 
         self._rebuild_skeleton_from_bind()
         self.selected_joint = len(self.joint_names) - 1
@@ -428,6 +522,21 @@ class SpotRigWindow(QMainWindow):
         self.update_viewport_full()
         self._notify(f"Reparented joint [{child_idx}] to {parent_idx}.")
 
+    def clear_parent_selected_joint(self) -> None:
+        if self.selected_joint is None:
+            self._notify("Select a joint first.")
+            return
+        child_idx = self.selected_joint
+        if self.joint_parents[child_idx] == -1:
+            self._notify("Selected joint is already a root.")
+            return
+        self.joint_parents[child_idx] = -1
+        self._rebuild_skeleton_from_bind()
+        if self.toolbar:
+            self.toolbar.set_joint_names(self.joint_names)
+        self.update_viewport_full()
+        self._notify(f"Cleared parent for joint [{child_idx}].")
+
     def reset_bind_pose(self) -> None:
         if self._orig_bind_positions is None:
             self._notify("No original bind pose available.")
@@ -435,6 +544,8 @@ class SpotRigWindow(QMainWindow):
         self.joint_names = list(self._orig_joint_names)
         self.joint_parents = list(self._orig_joint_parents)
         self.bind_positions = np.array(self._orig_bind_positions, copy=True)
+        if self._orig_bind_locals is not None:
+            self._bind_locals = [np.array(m, copy=True) for m in self._orig_bind_locals]
         self._rebuild_skeleton_from_bind()
         if self.toolbar:
             self.toolbar.set_joint_names(self.joint_names)
@@ -485,6 +596,62 @@ class SpotRigWindow(QMainWindow):
             parents=self.joint_parents,
         )
         self._notify(f"Skeleton exported: {path}")
+
+    def render_frames_vtk(self, out_dir: str, fps: int, width: int, height: int) -> None:
+        if self.mesh is None or self.skeleton is None:
+            self._notify("No mesh loaded; cannot render frames.")
+            return
+        if self.compile_mode:
+            self._notify("Disable compile mode before rendering frames.")
+            return
+        if self.weights is None or self.simple_weights is None:
+            self._notify("Weights missing; recompute weights first.")
+            return
+
+        os.makedirs(out_dir, exist_ok=True)
+
+        keyframes = list(self.timeline.keyframes) if self.timeline else []
+        if not keyframes:
+            keyframes = [np.array(self.joint_transforms, copy=True)]
+
+        renderer = OffscreenVtkRenderer(width=width, height=height)
+        render_rot = _rotation_y(np.radians(RENDER_YAW_DEG))
+        renderer.set_mesh(self.mesh.vertices, self.mesh.faces, rotation=render_rot)
+
+        original_transforms = np.array(self.joint_transforms, copy=True)
+
+        try:
+            for idx, transforms in enumerate(keyframes):
+                pose = np.array(transforms, copy=True)
+                M_skin = self.skeleton.skinning_matrices(pose)
+                if self.skinning_mode == "simple":
+                    weights = self.simple_weights_topk or self.simple_weights
+                else:
+                    weights = self.weights_topk or self.weights
+                deformed = linear_blend_skinning(
+                    self.mesh.vertices,
+                    weights,
+                    M_skin,
+                    topk=None,
+                    normalize=False,
+                )
+                renderer.update_vertices(deformed)
+                out_path = os.path.join(out_dir, f"frame_{idx:04d}.png")
+                renderer.render_to_file(out_path)
+        finally:
+            renderer.close()
+            self.joint_transforms = original_transforms
+            self._latest_state_version += 1
+            self._pending_compute = True
+
+        self._notify(f"Rendered {len(keyframes)} frames to {out_dir} at {fps} FPS.")
+
+    def make_video_from_frames(self, frames_dir: str, video_path: str, fps: int) -> None:
+        try:
+            frames_to_video(frames_dir, video_path, fps=fps)
+            self._notify(f"Video saved: {video_path}")
+        except Exception as exc:  # noqa: BLE001
+            self._notify(f"Video export failed: {exc}")
 
     def recompute_weights(self) -> None:
         if self.mesh is None or self.skeleton is None:
@@ -611,6 +778,52 @@ class SpotRigWindow(QMainWindow):
     def _on_weights_failed(self, msg: str) -> None:
         self._weights_inflight = False
         self._notify(f"Weights computation failed: {msg}")
+
+    def _pick_joint_index(self, preferred: list[str]) -> int | None:
+        if not self.joint_names:
+            return None
+        lower_map = {name.lower(): idx for idx, name in enumerate(self.joint_names)}
+        for key in preferred:
+            idx = lower_map.get(key.lower())
+            if idx is not None:
+                return idx
+        for key in preferred:
+            key_lower = key.lower()
+            for idx, name in enumerate(self.joint_names):
+                if key_lower in name.lower():
+                    return idx
+        return None
+
+    def generate_demo_keyframes(self):
+        if self.skeleton is None or self.joint_transforms is None:
+            self._notify("No skeleton loaded; cannot generate demo keyframes.")
+            return []
+        frame_count = int(max(1, round(DEMO_DURATION * DEMO_FPS)))
+        base = np.array(self.joint_transforms, copy=True)
+        head_idx = self._pick_joint_index(["head", "neck_mid", "neck_root", "neck"])
+        neck_idx = self._pick_joint_index(["neck_mid", "neck_root", "neck"])
+        if head_idx is None and neck_idx is None:
+            self._notify("No head/neck joint found for demo.")
+            return []
+
+        times = np.linspace(0.0, DEMO_DURATION, frame_count, endpoint=False)
+        keyframes: list[np.ndarray] = []
+        for t in times:
+            phase = (t / DEMO_DURATION) * (2.0 * np.pi)
+            head_angle = float(np.sin(phase) * DEMO_HEAD_YAW)
+            neck_angle = float(np.sin(phase) * DEMO_NECK_YAW)
+            frame = np.array(base, copy=True)
+            if head_idx is not None:
+                R_head = _rotation_y(head_angle)
+                frame[head_idx] = _apply_local_rotation(base[head_idx], R_head)
+            if neck_idx is not None and neck_idx != head_idx:
+                R_neck = _rotation_y(neck_angle)
+                frame[neck_idx] = _apply_local_rotation(base[neck_idx], R_neck)
+            keyframes.append(frame)
+
+        self.set_transforms(np.array(keyframes[0], copy=True))
+        self.update_viewport_deformed()
+        return keyframes
     # --------------------------------------------------------------- UI hooks
 
     def get_transforms(self):

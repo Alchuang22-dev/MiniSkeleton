@@ -168,29 +168,14 @@ class OffscreenRenderer:
     # ------------------------------------------------------------------
     # 对外 API
     # ------------------------------------------------------------------
-    def render_mesh(
+    def _draw_mesh(
         self,
         vertices: np.ndarray,
         faces: np.ndarray,
-        out_path: str,
         normals: Optional[np.ndarray] = None,
         model_matrix: Optional[np.ndarray] = None,
     ) -> None:
-        """渲染一个三角网格并保存为 PNG.
-
-        Parameters
-        ----------
-        vertices:
-            (N, 3) 顶点坐标。
-        faces:
-            (F, 3) 的整型三角面索引。
-        out_path:
-            输出 PNG 路径。
-        normals:
-            可选 (N, 3) 顶点法线；若为 None，将在 CPU 上简单按面平均计算。
-        model_matrix:
-            可选 (4, 4) 模型矩阵；默认单位矩阵。
-        """
+        """Draw a single mesh into the current framebuffer."""
         v = np.asarray(vertices, dtype=np.float32)
         f = np.asarray(faces, dtype=np.int32)
         if v.ndim != 2 or v.shape[1] != 3:
@@ -217,11 +202,8 @@ class OffscreenRenderer:
         )
         mvp = proj @ view @ model
 
-        self.fbo.use()
-        self.fbo.clear(*self.background)
-
         # 组装 buffer
-        # 顶点 + 法线 按顺序 interleave
+        # 顶点 + 法线 按顺序interleave
         vbo_data = np.hstack([v, n]).astype("f4").tobytes()
         vbo = self.ctx.buffer(vbo_data)
         ibo = self.ctx.buffer(f.astype("i4").tobytes())
@@ -237,13 +219,49 @@ class OffscreenRenderer:
         # 绘制
         vao.render()
 
-        # 读回像素并保存
+    def render_mesh(
+        self,
+        vertices: np.ndarray,
+        faces: np.ndarray,
+        out_path: str,
+        normals: Optional[np.ndarray] = None,
+        model_matrix: Optional[np.ndarray] = None,
+    ) -> None:
+        """Render a single mesh and save to PNG."""
+        self.fbo.use()
+        self.fbo.clear(*self.background)
+        self._draw_mesh(vertices, faces, normals=normals, model_matrix=model_matrix)
+
         data = self.fbo.read(components=4, dtype="f1")
         img = Image.frombytes("RGBA", (self.width, self.height), data)
-        # moderngl 的原点在左下，需要翻转
         img = img.transpose(Image.FLIP_TOP_BOTTOM)
 
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        out_dir = os.path.dirname(out_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        img.save(out_path)
+
+    def render_meshes(
+        self,
+        meshes: list[tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]],
+        out_path: str,
+    ) -> None:
+        """Render multiple meshes into one PNG.
+
+        meshes: [(vertices, faces, normals, model_matrix), ...]
+        """
+        self.fbo.use()
+        self.fbo.clear(*self.background)
+        for vertices, faces, normals, model_matrix in meshes:
+            self._draw_mesh(vertices, faces, normals=normals, model_matrix=model_matrix)
+
+        data = self.fbo.read(components=4, dtype="f1")
+        img = Image.frombytes("RGBA", (self.width, self.height), data)
+        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+
+        out_dir = os.path.dirname(out_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
         img.save(out_path)
 
     @staticmethod

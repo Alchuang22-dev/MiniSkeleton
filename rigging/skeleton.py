@@ -148,6 +148,51 @@ class Skeleton:
             joints[j].inv_bind = np.linalg.inv(G_bind[j]).astype(dtype)
         return skel
 
+    @staticmethod
+    def from_bind_matrices(
+        names: Sequence[str],
+        parents: Sequence[int],
+        bind_globals: np.ndarray,
+        dtype=np.float32,
+    ) -> "Skeleton":
+        """
+        Build skeleton from bind GLOBAL matrices.
+
+        Assumptions:
+          - bind_globals[j] is the GLOBAL 4x4 matrix of joint j in bind pose.
+          - Parent at index p has bind_globals[p].
+          - Local bind is computed as inv(G_parent) @ G_child.
+        """
+        names = list(names)
+        parents = np.asarray(parents, dtype=np.int32)
+        G = np.asarray(bind_globals, dtype=dtype)
+
+        if G.ndim != 3 or G.shape[1:] != (4, 4):
+            raise ValueError("bind_globals must be (J,4,4) array")
+
+        J = len(names)
+        if not (len(parents) == J and G.shape[0] == J):
+            raise ValueError("names/parents/bind_globals size mismatch")
+
+        joints: List[Joint] = []
+        for j in range(J):
+            p = parents[j]
+            if p < 0:
+                bind_local = G[j]
+            else:
+                bind_local = np.linalg.inv(G[p]) @ G[j]
+            inv_bind = np.linalg.inv(G[j])
+            joints.append(
+                Joint(
+                    name=names[j],
+                    parent=int(p),
+                    bind_local=bind_local.astype(dtype),
+                    inv_bind=inv_bind.astype(dtype),
+                )
+            )
+
+        return Skeleton(joints)
+
     # -------- FK --------
     def forward_kinematics_local(self, local_T: Sequence[np.ndarray]) -> np.ndarray:
         """

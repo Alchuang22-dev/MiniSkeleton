@@ -107,7 +107,7 @@ class HeatWeightsConfig:
     smooth_passes: int = 0               # 结果微调平滑次数（拉普拉斯一阶迭代）
     eps: float = 1e-12                   # 数值稳定项
     # Solver
-    solver: str = "splu"                 # "splu"（推荐）|"cg"（大网格可用）|"auto"
+    solver: str = "auto"                 # "auto"（优先 splu, 失败回退）|"splu"|"bicgstab"|"cg"
     cg_tol: float = 1e-6                 # CG 容差
     cg_maxiter: int = 200
 
@@ -185,7 +185,7 @@ def compute_heat_weights(mesh: Mesh, skel, cfg: Optional[HeatWeightsConfig] = No
         except Exception:
             # 回退到 CG
             lu = None
-            solver_mode = "cg"
+            solver_mode = "bicgstab"
 
     # 为每个关节构造 seed：对其相邻骨段取最小距离 → 高斯核
     inc_bones = _incident_bones_per_joint(J, edges)
@@ -223,28 +223,46 @@ def compute_heat_weights(mesh: Mesh, skel, cfg: Optional[HeatWeightsConfig] = No
             sol = lu.solve(rhs.astype(np.float64)).astype(np.float32)  # higher precision solve
             W[:, j] = np.maximum(sol, 0.0)
     else:
-        # CG 逐列
+        # Iterative fallback (A_sys is generally non-symmetric: use bicgstab by default)
         for j in range(J):
             rhs = S[:, j].astype(np.float32)
 
-            try:
-                # SciPy 新版：cg(A, b, rtol=..., atol=..., maxiter=...)
-                sol, info = spla.cg(
-                    A_sys, rhs,
-                    rtol=cfg.cg_tol,
-                    atol=0.0,
-                    maxiter=cfg.cg_maxiter,
-                )
-            except TypeError:
-                # SciPy 旧版：cg(A, b, maxiter=...)（无 rtol/atol）
-                sol, info = spla.cg(
-                    A_sys, rhs,
-                    maxiter=cfg.cg_maxiter,
-                )
+            if solver_mode == "bicgstab":
+                try:
+                    sol, info = spla.bicgstab(
+                        A_sys, rhs,
+                        rtol=cfg.cg_tol,
+                        atol=0.0,
+                        maxiter=cfg.cg_maxiter,
+                    )
+                except TypeError:
+                    sol, info = spla.bicgstab(
+                        A_sys, rhs,
+                        maxiter=cfg.cg_maxiter,
+                    )
+            elif solver_mode == "cg":
+                # CG requires SPD; keep for explicit use only.
+                try:
+                    sol, info = spla.cg(
+                        A_sys, rhs,
+                        rtol=cfg.cg_tol,
+                        atol=0.0,
+                        maxiter=cfg.cg_maxiter,
+                    )
+                except TypeError:
+                    sol, info = spla.cg(
+                        A_sys, rhs,
+                        maxiter=cfg.cg_maxiter,
+                    )
+            else:
+                raise ValueError(f"Unsupported solver: {cfg.solver}")
 
             if info != 0:
-                # 失败回退
+                # fallback to rhs
                 sol = rhs
+
+            if not np.all(np.isfinite(sol)):
+                raise RuntimeError("Heat weights solver produced NaN/Inf values.")
 
             W[:, j] = np.maximum(sol.astype(np.float32), 0.0)
 
