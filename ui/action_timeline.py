@@ -20,6 +20,7 @@ class ActionTimeline(QWidget):
         on_update_mesh,
         on_status,
         on_generate_demo=None,
+        on_generate_walk=None,
         parent=None,
     ):
         super().__init__(parent)
@@ -28,6 +29,7 @@ class ActionTimeline(QWidget):
         self.on_update_mesh = on_update_mesh
         self.on_status = on_status
         self.on_generate_demo = on_generate_demo
+        self.on_generate_walk = on_generate_walk
 
         self.keyframes: list[np.ndarray] = []
         self.current_frame_index: int = -1
@@ -55,6 +57,11 @@ class ActionTimeline(QWidget):
             btn_demo = QPushButton("Auto head shake")
             btn_demo.clicked.connect(self._generate_demo_keyframes)
             layout.addWidget(btn_demo)
+
+        if self.on_generate_walk is not None:
+            btn_walk = QPushButton("Auto walking")
+            btn_walk.clicked.connect(self._generate_walk_keyframes)
+            layout.addWidget(btn_walk)
 
         btn_clear = QPushButton("Clear keyframes")
         btn_clear.clicked.connect(self.clear_keyframes)
@@ -107,6 +114,16 @@ class ActionTimeline(QWidget):
             return
         self.set_keyframes(keyframes, current_index=0)
         self._notify(f"Generated {len(keyframes)} demo keyframes.")
+
+    def _generate_walk_keyframes(self):
+        if self.on_generate_walk is None:
+            return
+        keyframes = self.on_generate_walk()
+        if not keyframes:
+            self._notify("Walking keyframes generation failed.")
+            return
+        self.set_keyframes(keyframes, current_index=0)
+        self._notify(f"Generated {len(keyframes)} walking keyframes.")
 
     def toggle_playback(self):
         if not self.is_playing:

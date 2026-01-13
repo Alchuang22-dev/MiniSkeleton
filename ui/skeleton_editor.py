@@ -29,6 +29,17 @@ from render.offscreen_vtk import OffscreenVtkRenderer
 from tools.export_video import frames_to_video
 
 from ui.action_timeline import ActionTimeline
+from ui.auto_motion import (
+    DEMO_DURATION,
+    DEMO_FPS,
+    DEMO_HEAD_YAW,
+    DEMO_NECK_YAW,
+    WALK_BASE_DURATION,
+    WALK_LEG_SWING,
+    WALK_REPEAT,
+    build_head_shake_keyframes,
+    build_walk_keyframes,
+)
 from ui.compute_worker import DeformWorker, WeightsWorker
 from ui.export_panel import RigControlPanel
 from ui.viewport import RigViewport
@@ -40,22 +51,12 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     sp = None
 
-DEMO_FPS = 30
-DEMO_DURATION = 1.5
-DEMO_HEAD_YAW = 0.35
-DEMO_NECK_YAW = 0.15
 RENDER_YAW_DEG = -90.0
 
 
 def _rotation_y(angle_rad: float) -> np.ndarray:
     R = euler_xyz_to_rot(0.0, float(angle_rad), 0.0)
     return R.astype(np.float32)
-
-
-def _apply_local_rotation(base: np.ndarray, R: np.ndarray) -> np.ndarray:
-    out = np.array(base, copy=True)
-    out[:3, :3] = R @ out[:3, :3]
-    return out
 
 
 class SpotRigWindow(QMainWindow):
@@ -133,6 +134,7 @@ class SpotRigWindow(QMainWindow):
             on_update_mesh=self.request_deform_update,
             on_status=self._notify,
             on_generate_demo=self.generate_demo_keyframes,
+            on_generate_walk=self.generate_walk_keyframes,
         )
         self.toolbar = RigControlPanel(
             timeline_widget=self.timeline,
@@ -973,47 +975,23 @@ class SpotRigWindow(QMainWindow):
             "clipping_range": tuple(float(v) for v in cam.GetClippingRange()),
         }
 
-    def _pick_joint_index(self, preferred: list[str]) -> int | None:
-        if not self.joint_names:
-            return None
-        lower_map = {name.lower(): idx for idx, name in enumerate(self.joint_names)}
-        for key in preferred:
-            idx = lower_map.get(key.lower())
-            if idx is not None:
-                return idx
-        for key in preferred:
-            key_lower = key.lower()
-            for idx, name in enumerate(self.joint_names):
-                if key_lower in name.lower():
-                    return idx
-        return None
-
     def generate_demo_keyframes(self):
         if self.skeleton is None or self.joint_transforms is None:
             self._notify("No skeleton loaded; cannot generate demo keyframes.")
             return []
-        frame_count = int(max(1, round(DEMO_DURATION * DEMO_FPS)))
         base = np.array(self.joint_transforms, copy=True)
-        head_idx = self._pick_joint_index(["head", "neck_mid", "neck_root", "neck"])
-        neck_idx = self._pick_joint_index(["neck_mid", "neck_root", "neck"])
-        if head_idx is None and neck_idx is None:
+        names = self.joint_names or [j.name for j in self.skeleton.joints]
+        keyframes = build_head_shake_keyframes(
+            names,
+            base,
+            fps=DEMO_FPS,
+            duration=DEMO_DURATION,
+            head_yaw=DEMO_HEAD_YAW,
+            neck_yaw=DEMO_NECK_YAW,
+        )
+        if not keyframes:
             self._notify("No head/neck joint found for demo.")
             return []
-
-        times = np.linspace(0.0, DEMO_DURATION, frame_count, endpoint=False)
-        keyframes: list[np.ndarray] = []
-        for t in times:
-            phase = (t / DEMO_DURATION) * (2.0 * np.pi)
-            head_angle = float(np.sin(phase) * DEMO_HEAD_YAW)
-            neck_angle = float(np.sin(phase) * DEMO_NECK_YAW)
-            frame = np.array(base, copy=True)
-            if head_idx is not None:
-                R_head = _rotation_y(head_angle)
-                frame[head_idx] = _apply_local_rotation(base[head_idx], R_head)
-            if neck_idx is not None and neck_idx != head_idx:
-                R_neck = _rotation_y(neck_angle)
-                frame[neck_idx] = _apply_local_rotation(base[neck_idx], R_neck)
-            keyframes.append(frame)
 
         self.set_transforms(np.array(keyframes[0], copy=True))
         self.update_viewport_deformed()
@@ -1026,6 +1004,47 @@ class SpotRigWindow(QMainWindow):
             self._notify("Set a frames output directory to save demo keyframes.")
             return keyframes
         self._notify("Rendering demo keyframes to disk (UI pipeline)...")
+        self.render_frames_vtk(out_dir, fps, width, height, keyframes=keyframes)
+        return keyframes
+
+    def generate_walk_keyframes(self):
+        if self.skeleton is None or self.joint_transforms is None:
+            self._notify("No skeleton loaded; cannot generate walking keyframes.")
+            return []
+        export_settings = self._get_export_settings()
+        if export_settings is not None:
+            out_dir, fps, width, height = export_settings
+        else:
+            out_dir, fps, width, height = "", DEMO_FPS, 1024, 1024
+
+        if width < 512 or height < 512:
+            width = max(width, 512)
+            height = max(height, 512)
+            self._notify(f"Walking export size clamped to {width}x{height}.")
+
+        base = np.array(self.joint_transforms, copy=True)
+        names = self.joint_names or [j.name for j in self.skeleton.joints]
+        keyframes = build_walk_keyframes(
+            names,
+            base,
+            fps=fps,
+            duration=WALK_BASE_DURATION,
+            repeat=WALK_REPEAT,
+            leg_swing=WALK_LEG_SWING,
+            close_loop=True,
+        )
+        if not keyframes:
+            self._notify("No leg joints found for walking demo.")
+            return []
+
+        self.set_transforms(np.array(keyframes[0], copy=True))
+        self.update_viewport_deformed()
+
+        if not out_dir:
+            self._notify("Set a frames output directory to save walking keyframes.")
+            return keyframes
+
+        self._notify("Rendering walking keyframes to disk (UI pipeline)...")
         self.render_frames_vtk(out_dir, fps, width, height, keyframes=keyframes)
         return keyframes
     # --------------------------------------------------------------- UI hooks
