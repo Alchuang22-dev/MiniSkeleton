@@ -24,7 +24,7 @@ class OffscreenVtkRenderer:
         self.width = int(width)
         self.height = int(height)
         self.plotter = pv.Plotter(off_screen=True, window_size=(self.width, self.height))
-        self.plotter.set_background(*background)
+        self.plotter.set_background(background)
 
         self.mesh_actor = None
         self._mesh_points = None
@@ -49,6 +49,25 @@ class OffscreenVtkRenderer:
         self.plotter.camera.elevation = 15
         self.plotter.camera.azimuth = -60
         self.plotter.camera.zoom(1.4)
+
+    def apply_camera_state(
+        self,
+        *,
+        position: Tuple[float, float, float],
+        focal_point: Tuple[float, float, float],
+        view_up: Tuple[float, float, float],
+        view_angle: float | None = None,
+        clipping_range: Tuple[float, float] | None = None,
+    ) -> None:
+        """Apply explicit camera parameters (e.g., copied from the UI viewport)."""
+        cam = self.plotter.camera
+        cam.SetPosition(*[float(v) for v in position])
+        cam.SetFocalPoint(*[float(v) for v in focal_point])
+        cam.SetViewUp(*[float(v) for v in view_up])
+        if view_angle is not None:
+            cam.SetViewAngle(float(view_angle))
+        if clipping_range is not None:
+            cam.SetClippingRange(float(clipping_range[0]), float(clipping_range[1]))
 
     def set_mesh(
         self,
@@ -99,6 +118,8 @@ class OffscreenVtkRenderer:
 
     def render_to_file(self, out_path: str) -> None:
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        # Ensure latest mesh updates are rendered before capture.
+        self.plotter.render()
         self.plotter.screenshot(out_path, transparent_background=False)
 
     def close(self) -> None:

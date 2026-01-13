@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+import glob
 import os
 import sys
 import numpy as np
@@ -18,7 +20,7 @@ from PySide6.QtWidgets import (
 from rigging.mesh_io import Mesh
 from rigging.gltf_loader import load_mesh_and_skeleton_from_glb
 from rigging.skeleton import Skeleton, euler_xyz_to_rot
-from rigging.lbs import linear_blend_skinning, make_topk_weights
+from rigging.lbs import TopKWeights, linear_blend_skinning, make_topk_weights
 from rigging.weights_heat import HeatWeightsConfig, compute_heat_weights
 from rigging.rig_io import save_rig_npz
 from rigging.skeleton_optimize import optimize_quadruped_bind_positions
@@ -33,6 +35,10 @@ from ui.viewport import RigViewport
 from ui.weight_tools import compute_simple_weights
 from ui.style import apply_style
 
+try:
+    import scipy.sparse as sp  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    sp = None
 
 DEMO_FPS = 30
 DEMO_DURATION = 1.5
@@ -144,6 +150,9 @@ class SpotRigWindow(QMainWindow):
             on_render_frames=self.render_frames_vtk,
             on_make_video=self.make_video_from_frames,
             on_save_rig=self.save_rig_bundle,
+            on_export_joint_positions=self.export_joint_positions,
+            on_export_bone_edges=self.export_skeleton_edges,
+            on_export_weights=self.export_bind_weights,
         )
         self.viewport = RigViewport(self, self._notify)
 
@@ -597,7 +606,14 @@ class SpotRigWindow(QMainWindow):
         )
         self._notify(f"Skeleton exported: {path}")
 
-    def render_frames_vtk(self, out_dir: str, fps: int, width: int, height: int) -> None:
+    def render_frames_vtk(
+        self,
+        out_dir: str,
+        fps: int,
+        width: int,
+        height: int,
+        keyframes: list[np.ndarray] | None = None,
+    ) -> None:
         if self.mesh is None or self.skeleton is None:
             self._notify("No mesh loaded; cannot render frames.")
             return
@@ -610,13 +626,23 @@ class SpotRigWindow(QMainWindow):
 
         os.makedirs(out_dir, exist_ok=True)
 
-        keyframes = list(self.timeline.keyframes) if self.timeline else []
-        if not keyframes:
-            keyframes = [np.array(self.joint_transforms, copy=True)]
+        if keyframes is None:
+            keyframes = list(self.timeline.keyframes) if self.timeline else []
+            if not keyframes:
+                keyframes = [np.array(self.joint_transforms, copy=True)]
 
+        camera_state = self._get_viewport_camera_state()
+        use_viewport_camera = camera_state is not None
         renderer = OffscreenVtkRenderer(width=width, height=height)
-        render_rot = _rotation_y(np.radians(RENDER_YAW_DEG))
-        renderer.set_mesh(self.mesh.vertices, self.mesh.faces, rotation=render_rot)
+        render_rot = None if use_viewport_camera else _rotation_y(np.radians(RENDER_YAW_DEG))
+        renderer.set_mesh(
+            self.mesh.vertices,
+            self.mesh.faces,
+            rotation=render_rot,
+            apply_ui_camera=not use_viewport_camera,
+        )
+        if use_viewport_camera:
+            renderer.apply_camera_state(**camera_state)
 
         original_transforms = np.array(self.joint_transforms, copy=True)
 
@@ -646,7 +672,25 @@ class SpotRigWindow(QMainWindow):
 
         self._notify(f"Rendered {len(keyframes)} frames to {out_dir} at {fps} FPS.")
 
-    def make_video_from_frames(self, frames_dir: str, video_path: str, fps: int) -> None:
+    def make_video_from_frames(
+        self,
+        frames_dir: str,
+        video_path: str,
+        fps: int,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        if self.mesh is None or self.skeleton is None:
+            self._notify("No mesh loaded; cannot export video.")
+            return
+        if self.compile_mode:
+            self._notify("Disable compile mode before exporting video.")
+            return
+
+        frame_glob = os.path.join(frames_dir, "frame_*.png")
+        if not glob.glob(frame_glob):
+            self._notify("No frames found on disk; render frames first.")
+            return
         try:
             frames_to_video(frames_dir, video_path, fps=fps)
             self._notify(f"Video saved: {video_path}")
@@ -687,6 +731,126 @@ class SpotRigWindow(QMainWindow):
             self.joint_parents,
         )
         self._notify(f"Saved rig bundle: {path}")
+
+    def export_joint_positions(self) -> None:
+        if self.skeleton is None:
+            self._notify("No skeleton loaded; cannot export joints.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export joint positions",
+            "out/debug/joints.csv",
+            "CSV Files (*.csv)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path = f"{path}.csv"
+        names = self.joint_names or [j.name for j in self.skeleton.joints]
+        parents = self.joint_parents or [j.parent for j in self.skeleton.joints]
+        globals_mats = self.compute_current_global_mats()
+        positions = globals_mats[:, :3, 3]
+        with open(path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["index", "name", "parent", "x", "y", "z"])
+            for idx, pos in enumerate(positions):
+                name = names[idx] if idx < len(names) else f"joint_{idx}"
+                parent = parents[idx] if idx < len(parents) else -1
+                writer.writerow(
+                    [
+                        idx,
+                        name,
+                        parent,
+                        f"{pos[0]:.6f}",
+                        f"{pos[1]:.6f}",
+                        f"{pos[2]:.6f}",
+                    ]
+                )
+        self._notify(f"Joint positions exported: {path}")
+
+    def export_skeleton_edges(self) -> None:
+        if self.skeleton is None:
+            self._notify("No skeleton loaded; cannot export skeleton.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export skeleton edges",
+            "out/debug/edges.csv",
+            "CSV Files (*.csv)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path = f"{path}.csv"
+        names = self.joint_names or [j.name for j in self.skeleton.joints]
+        parents = self.joint_parents or [j.parent for j in self.skeleton.joints]
+        with open(path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["parent_idx", "child_idx", "parent_name", "child_name"])
+            for child_idx, parent_idx in enumerate(parents):
+                if parent_idx < 0:
+                    continue
+                parent_name = names[parent_idx] if parent_idx < len(names) else f"joint_{parent_idx}"
+                child_name = names[child_idx] if child_idx < len(names) else f"joint_{child_idx}"
+                writer.writerow([parent_idx, child_idx, parent_name, child_name])
+        self._notify(f"Skeleton edges exported: {path}")
+
+    def export_bind_weights(self) -> None:
+        if self.skeleton is None:
+            self._notify("No skeleton loaded; cannot export weights.")
+            return
+        weights = self.weights_topk or self.weights
+        simple = self.simple_weights_topk or self.simple_weights
+        if weights is None and simple is None:
+            self._notify("Weights missing; recompute weights first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export bind weights",
+            "out/debug/weights.npz",
+            "NPZ Files (*.npz)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".npz"):
+            path = f"{path}.npz"
+        names = self.joint_names or [j.name for j in self.skeleton.joints]
+        parents = self.joint_parents or [j.parent for j in self.skeleton.joints]
+        max_len = max((len(n) for n in names), default=1)
+        payload: dict[str, np.ndarray | str] = {
+            "joint_names": np.asarray(names, dtype=f"<U{max_len}"),
+            "parents": np.asarray(parents, dtype=np.int32),
+        }
+
+        def _pack_weights(prefix: str, value) -> None:
+            if value is None:
+                return
+            if isinstance(value, TopKWeights):
+                payload[f"{prefix}_format"] = "topk"
+                payload[f"{prefix}_indices"] = np.asarray(value.indices, dtype=np.int32)
+                payload[f"{prefix}_values"] = np.asarray(value.weights, dtype=np.float32)
+                return
+            if sp is not None and sp.isspmatrix(value):
+                payload[f"{prefix}_format"] = "csr"
+                csr = value.tocsr()
+                payload[f"{prefix}_data"] = np.asarray(csr.data, dtype=np.float32)
+                payload[f"{prefix}_indices"] = np.asarray(csr.indices, dtype=np.int32)
+                payload[f"{prefix}_indptr"] = np.asarray(csr.indptr, dtype=np.int32)
+                payload[f"{prefix}_shape"] = np.asarray(csr.shape, dtype=np.int32)
+                return
+            if isinstance(value, tuple) and len(value) == 2:
+                idxs, vals = value
+                payload[f"{prefix}_format"] = "topk_tuple"
+                payload[f"{prefix}_indices"] = np.asarray(idxs, dtype=np.int32)
+                payload[f"{prefix}_values"] = np.asarray(vals, dtype=np.float32)
+                return
+            payload[f"{prefix}_format"] = "dense"
+            payload[prefix] = np.asarray(value, dtype=np.float32)
+
+        _pack_weights("weights", weights)
+        _pack_weights("simple_weights", simple)
+        np.savez_compressed(path, **payload)
+        self._notify(f"Bind weights exported: {path}")
 
     def _unique_joint_name(self, base: str) -> str:
         existing = set(self.joint_names)
@@ -779,6 +943,36 @@ class SpotRigWindow(QMainWindow):
         self._weights_inflight = False
         self._notify(f"Weights computation failed: {msg}")
 
+    def _get_export_settings(self):
+        if self.toolbar is None:
+            return None
+        frames_edit = getattr(self.toolbar, "frames_path_edit", None)
+        fps_spin = getattr(self.toolbar, "fps_spin", None)
+        width_spin = getattr(self.toolbar, "width_spin", None)
+        height_spin = getattr(self.toolbar, "height_spin", None)
+        if frames_edit is None:
+            return None
+        out_dir = frames_edit.text().strip()
+        fps = fps_spin.value() if fps_spin is not None else 30
+        width = width_spin.value() if width_spin is not None else 1024
+        height = height_spin.value() if height_spin is not None else 1024
+        return out_dir, fps, width, height
+
+    def _get_viewport_camera_state(self):
+        if self.viewport is None:
+            return None
+        plotter = getattr(self.viewport, "plotter", None)
+        cam = getattr(plotter, "camera", None) if plotter is not None else None
+        if cam is None:
+            return None
+        return {
+            "position": tuple(float(v) for v in cam.GetPosition()),
+            "focal_point": tuple(float(v) for v in cam.GetFocalPoint()),
+            "view_up": tuple(float(v) for v in cam.GetViewUp()),
+            "view_angle": float(cam.GetViewAngle()),
+            "clipping_range": tuple(float(v) for v in cam.GetClippingRange()),
+        }
+
     def _pick_joint_index(self, preferred: list[str]) -> int | None:
         if not self.joint_names:
             return None
@@ -823,6 +1017,16 @@ class SpotRigWindow(QMainWindow):
 
         self.set_transforms(np.array(keyframes[0], copy=True))
         self.update_viewport_deformed()
+        export_settings = self._get_export_settings()
+        if export_settings is None:
+            self._notify("Set a frames output directory to save demo keyframes.")
+            return keyframes
+        out_dir, fps, width, height = export_settings
+        if not out_dir:
+            self._notify("Set a frames output directory to save demo keyframes.")
+            return keyframes
+        self._notify("Rendering demo keyframes to disk (UI pipeline)...")
+        self.render_frames_vtk(out_dir, fps, width, height, keyframes=keyframes)
         return keyframes
     # --------------------------------------------------------------- UI hooks
 

@@ -40,6 +40,9 @@ class RigControlPanel(QWidget):
         on_render_frames=None,
         on_make_video=None,
         on_save_rig=None,
+        on_export_joint_positions=None,
+        on_export_bone_edges=None,
+        on_export_weights=None,
         parent=None,
     ):
         super().__init__(parent)
@@ -49,6 +52,9 @@ class RigControlPanel(QWidget):
         self.on_load_model = on_load_model
         self.on_render_frames = on_render_frames
         self.on_make_video = on_make_video
+        self.on_export_joint_positions = on_export_joint_positions
+        self.on_export_bone_edges = on_export_bone_edges
+        self.on_export_weights = on_export_weights
 
         self.skinning_combo: QComboBox | None = None
         self.compile_panel: SkeletonCompilePanel | None = None
@@ -219,6 +225,33 @@ class RigControlPanel(QWidget):
             video_group.setLayout(video_layout)
             layout.addWidget(video_group)
 
+        # Debug export
+        if (
+            self.on_export_joint_positions is not None
+            or self.on_export_bone_edges is not None
+            or self.on_export_weights is not None
+        ):
+            debug_group = QGroupBox("Debug Export")
+            debug_layout = QVBoxLayout()
+
+            if self.on_export_joint_positions is not None:
+                btn_joints = QPushButton("Export joint positions")
+                btn_joints.clicked.connect(self.on_export_joint_positions)
+                debug_layout.addWidget(btn_joints)
+
+            if self.on_export_bone_edges is not None:
+                btn_edges = QPushButton("Export skeleton edges")
+                btn_edges.clicked.connect(self.on_export_bone_edges)
+                debug_layout.addWidget(btn_edges)
+
+            if self.on_export_weights is not None:
+                btn_weights = QPushButton("Export bind weights")
+                btn_weights.clicked.connect(self.on_export_weights)
+                debug_layout.addWidget(btn_weights)
+
+            debug_group.setLayout(debug_layout)
+            layout.addWidget(debug_group)
+
         # Timeline
         anim_group = QGroupBox("Animation / Keyframes")
         anim_layout = QVBoxLayout()
@@ -284,7 +317,9 @@ class RigControlPanel(QWidget):
         if not frames_dir or not video_path:
             return
         fps = self.fps_spin.value() if self.fps_spin is not None else 30
-        self.on_make_video(frames_dir, video_path, fps)
+        width = self.width_spin.value() if self.width_spin is not None else 1024
+        height = self.height_spin.value() if self.height_spin is not None else 1024
+        self.on_make_video(frames_dir, video_path, fps, width, height)
 
     def set_skinning_mode(self, mode: str):
         if self.skinning_combo is None:
