@@ -98,6 +98,7 @@ class SpotRigWindow(QMainWindow):
         self.selected_joint: int | None = None
         self.skinning_mode = "full"
         self.compile_mode = False
+        self.model_offset = np.zeros(3, dtype=np.float32)
 
         # UI components
         self.timeline: ActionTimeline | None = None
@@ -155,6 +156,8 @@ class SpotRigWindow(QMainWindow):
             on_export_joint_positions=self.export_joint_positions,
             on_export_bone_edges=self.export_skeleton_edges,
             on_export_weights=self.export_bind_weights,
+            on_set_model_offset=self.set_model_offset,
+            on_reset_model_offset=self.reset_model_offset,
         )
         self.viewport = RigViewport(self, self._notify)
 
@@ -637,8 +640,9 @@ class SpotRigWindow(QMainWindow):
         use_viewport_camera = camera_state is not None
         renderer = OffscreenVtkRenderer(width=width, height=height)
         render_rot = None if use_viewport_camera else _rotation_y(np.radians(RENDER_YAW_DEG))
+        offset = self.get_model_offset()
         renderer.set_mesh(
-            self.mesh.vertices,
+            self.mesh.vertices + offset,
             self.mesh.faces,
             rotation=render_rot,
             apply_ui_camera=not use_viewport_camera,
@@ -663,7 +667,7 @@ class SpotRigWindow(QMainWindow):
                     topk=None,
                     normalize=False,
                 )
-                renderer.update_vertices(deformed)
+                renderer.update_vertices(deformed + offset)
                 out_path = os.path.join(out_dir, f"frame_{idx:04d}.png")
                 renderer.render_to_file(out_path)
         finally:
@@ -1063,6 +1067,22 @@ class SpotRigWindow(QMainWindow):
     def update_viewport_full(self):
         if self.viewport:
             self.viewport.render_scene_full()
+
+    def get_model_offset(self) -> np.ndarray:
+        return np.array(self.model_offset, dtype=np.float32)
+
+    def set_model_offset(self, x: float, y: float, z: float) -> None:
+        self.model_offset = np.array([x, y, z], dtype=np.float32)
+        if self.toolbar is not None:
+            self.toolbar.set_model_offset((x, y, z))
+        if self.viewport is not None:
+            if getattr(self.viewport, "mesh_actor", None) is None:
+                self.viewport.render_scene_full()
+            else:
+                self.viewport.update_deformed_mesh_only()
+
+    def reset_model_offset(self) -> None:
+        self.set_model_offset(0.0, 0.0, 0.0)
 
     def request_deform_update(self) -> None:
         self._pending_compute = True

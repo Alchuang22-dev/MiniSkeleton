@@ -3,6 +3,7 @@
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -41,6 +42,8 @@ class RigControlPanel(QWidget):
         on_export_joint_positions=None,
         on_export_bone_edges=None,
         on_export_weights=None,
+        on_set_model_offset=None,
+        on_reset_model_offset=None,
         parent=None,
     ):
         super().__init__(parent)
@@ -53,6 +56,8 @@ class RigControlPanel(QWidget):
         self.on_export_joint_positions = on_export_joint_positions
         self.on_export_bone_edges = on_export_bone_edges
         self.on_export_weights = on_export_weights
+        self.on_set_model_offset = on_set_model_offset
+        self.on_reset_model_offset = on_reset_model_offset
 
         self.skinning_combo: QComboBox | None = None
         self.compile_panel: SkeletonCompilePanel | None = None
@@ -62,6 +67,10 @@ class RigControlPanel(QWidget):
         self.fps_spin: QSpinBox | None = None
         self.width_spin: QSpinBox | None = None
         self.height_spin: QSpinBox | None = None
+        self.offset_x_spin: QDoubleSpinBox | None = None
+        self.offset_y_spin: QDoubleSpinBox | None = None
+        self.offset_z_spin: QDoubleSpinBox | None = None
+        self._updating_offset = False
 
         self._compile_callbacks = {
             "on_toggle_compile": on_toggle_compile,
@@ -132,6 +141,46 @@ class RigControlPanel(QWidget):
         control_layout.addWidget(reset_button)
         control_group.setLayout(control_layout)
         add_group(control_group, 0)
+
+        # Model transform
+        if self.on_set_model_offset is not None:
+            transform_group = QGroupBox("Model Transform")
+            transform_layout = QVBoxLayout()
+
+            row = QHBoxLayout()
+            self.offset_x_spin = QDoubleSpinBox()
+            self.offset_x_spin.setRange(-9999.0, 9999.0)
+            self.offset_x_spin.setDecimals(3)
+            self.offset_x_spin.setSingleStep(0.1)
+            self.offset_x_spin.setPrefix("X ")
+            self.offset_x_spin.valueChanged.connect(self._emit_model_offset_changed)
+            row.addWidget(self.offset_x_spin)
+
+            self.offset_y_spin = QDoubleSpinBox()
+            self.offset_y_spin.setRange(-9999.0, 9999.0)
+            self.offset_y_spin.setDecimals(3)
+            self.offset_y_spin.setSingleStep(0.1)
+            self.offset_y_spin.setPrefix("Y ")
+            self.offset_y_spin.valueChanged.connect(self._emit_model_offset_changed)
+            row.addWidget(self.offset_y_spin)
+
+            self.offset_z_spin = QDoubleSpinBox()
+            self.offset_z_spin.setRange(-9999.0, 9999.0)
+            self.offset_z_spin.setDecimals(3)
+            self.offset_z_spin.setSingleStep(0.1)
+            self.offset_z_spin.setPrefix("Z ")
+            self.offset_z_spin.valueChanged.connect(self._emit_model_offset_changed)
+            row.addWidget(self.offset_z_spin)
+
+            transform_layout.addLayout(row)
+
+            if self.on_reset_model_offset is not None:
+                btn_reset_offset = QPushButton("Reset model position")
+                btn_reset_offset.clicked.connect(self._emit_reset_model_offset)
+                transform_layout.addWidget(btn_reset_offset)
+
+            transform_group.setLayout(transform_layout)
+            add_group(transform_group, 0)
 
         # Skinning
         skinning_group = QGroupBox("Skinning")
@@ -320,6 +369,35 @@ class RigControlPanel(QWidget):
         width = self.width_spin.value() if self.width_spin is not None else 1024
         height = self.height_spin.value() if self.height_spin is not None else 1024
         self.on_make_video(frames_dir, video_path, fps, width, height)
+
+    def _emit_model_offset_changed(self) -> None:
+        if self._updating_offset:
+            return
+        if self.on_set_model_offset is None:
+            return
+        if self.offset_x_spin is None or self.offset_y_spin is None or self.offset_z_spin is None:
+            return
+        self.on_set_model_offset(
+            float(self.offset_x_spin.value()),
+            float(self.offset_y_spin.value()),
+            float(self.offset_z_spin.value()),
+        )
+
+    def _emit_reset_model_offset(self) -> None:
+        if self.on_reset_model_offset is None:
+            return
+        self.on_reset_model_offset()
+
+    def set_model_offset(self, offset: tuple[float, float, float]) -> None:
+        if self.offset_x_spin is None or self.offset_y_spin is None or self.offset_z_spin is None:
+            return
+        self._updating_offset = True
+        try:
+            self.offset_x_spin.setValue(float(offset[0]))
+            self.offset_y_spin.setValue(float(offset[1]))
+            self.offset_z_spin.setValue(float(offset[2]))
+        finally:
+            self._updating_offset = False
 
     def set_skinning_mode(self, mode: str):
         if self.skinning_combo is None:
