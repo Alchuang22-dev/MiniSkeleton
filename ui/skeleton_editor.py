@@ -164,7 +164,7 @@ class SpotRigWindow(QMainWindow):
         splitter.addWidget(self.viewport)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([260, 1140])
+        splitter.setSizes([520, 880])
         layout.addWidget(splitter)
 
         self.statusBar().showMessage("Click red sphere to select a joint; drag arrows to move.")

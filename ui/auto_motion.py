@@ -9,7 +9,6 @@ import numpy as np
 
 from rigging.skeleton import euler_xyz_to_rot
 
-
 DEMO_FPS = 30
 DEMO_DURATION = 1.5
 DEMO_HEAD_YAW = 0.35
@@ -18,6 +17,12 @@ DEMO_NECK_YAW = 0.15
 WALK_BASE_DURATION = 2.0
 WALK_REPEAT = 5
 WALK_LEG_SWING = 0.25
+WALK_BACK_PHASE_OFFSET = 0.35
+WALK_KNEE_LIFT = 0.18
+WALK_ANKLE_LIFT = 0.12
+WALK_SPINE_SWAY = 0.05
+WALK_NECK_PITCH = 0.08
+WALK_HEAD_PITCH = 0.12
 
 
 def _rotation_y(angle_rad: float) -> np.ndarray:
@@ -26,6 +31,7 @@ def _rotation_y(angle_rad: float) -> np.ndarray:
 
 def _rotation_x(angle_rad: float) -> np.ndarray:
     return euler_xyz_to_rot(float(angle_rad), 0.0, 0.0).astype(np.float32)
+
 
 def _rotation_z(angle_rad: float) -> np.ndarray:
     return euler_xyz_to_rot(0.0, 0.0, float(angle_rad)).astype(np.float32)
@@ -97,54 +103,69 @@ def build_walk_keyframes(
     close_loop: bool = True,
 ) -> list[np.ndarray]:
     names = list(joint_names)
-    leg_back_left = pick_joint_index(
+
+    leg_back_left_hip = pick_joint_index(
         names,
-        [
-            "leg_back_L_hip",
-            "leg_back_L_knee",
-            "leg_back_L_ankle",
-            "leg_back_l",
-            "hind_left",
-            "back_left",
-            "leg1",
-        ],
+        ["leg_back_L_hip", "leg_back_l_hip", "hind_left_hip", "back_left_hip", "leg1_hip"],
     )
-    leg_back_right = pick_joint_index(
+    leg_back_left_knee = pick_joint_index(
         names,
-        [
-            "leg_back_R_hip",
-            "leg_back_R_knee",
-            "leg_back_R_ankle",
-            "leg_back_r",
-            "hind_right",
-            "back_right",
-            "leg2",
-        ],
+        ["leg_back_L_knee", "leg_back_l_knee", "hind_left_knee", "back_left_knee", "leg1_knee"],
     )
-    leg_front_left = pick_joint_index(
+    leg_back_left_ankle = pick_joint_index(
         names,
-        [
-            "leg_front_L_hip",
-            "leg_front_L_knee",
-            "leg_front_L_ankle",
-            "leg_front_l",
-            "front_left",
-            "leg3",
-        ],
+        ["leg_back_L_ankle", "leg_back_l_ankle", "hind_left_ankle", "back_left_ankle", "leg1_ankle"],
     )
-    leg_front_right = pick_joint_index(
+    leg_back_right_hip = pick_joint_index(
         names,
-        [
-            "leg_front_R_hip",
-            "leg_front_R_knee",
-            "leg_front_R_ankle",
-            "leg_front_r",
-            "front_right",
-            "leg4",
-        ],
+        ["leg_back_R_hip", "leg_back_r_hip", "hind_right_hip", "back_right_hip", "leg2_hip"],
+    )
+    leg_back_right_knee = pick_joint_index(
+        names,
+        ["leg_back_R_knee", "leg_back_r_knee", "hind_right_knee", "back_right_knee", "leg2_knee"],
+    )
+    leg_back_right_ankle = pick_joint_index(
+        names,
+        ["leg_back_R_ankle", "leg_back_r_ankle", "hind_right_ankle", "back_right_ankle", "leg2_ankle"],
+    )
+    leg_front_left_hip = pick_joint_index(
+        names,
+        ["leg_front_L_hip", "leg_front_l_hip", "front_left_hip", "leg3_hip"],
+    )
+    leg_front_left_knee = pick_joint_index(
+        names,
+        ["leg_front_L_knee", "leg_front_l_knee", "front_left_knee", "leg3_knee"],
+    )
+    leg_front_left_ankle = pick_joint_index(
+        names,
+        ["leg_front_L_ankle", "leg_front_l_ankle", "front_left_ankle", "leg3_ankle"],
+    )
+    leg_front_right_hip = pick_joint_index(
+        names,
+        ["leg_front_R_hip", "leg_front_r_hip", "front_right_hip", "leg4_hip"],
+    )
+    leg_front_right_knee = pick_joint_index(
+        names,
+        ["leg_front_R_knee", "leg_front_r_knee", "front_right_knee", "leg4_knee"],
+    )
+    leg_front_right_ankle = pick_joint_index(
+        names,
+        ["leg_front_R_ankle", "leg_front_r_ankle", "front_right_ankle", "leg4_ankle"],
     )
 
-    if all(idx is None for idx in (leg_back_left, leg_back_right, leg_front_left, leg_front_right)):
+    neck_idx = pick_joint_index(names, ["neck_mid", "neck_root", "neck"])
+    head_idx = pick_joint_index(names, ["head"])
+    spine_idx = pick_joint_index(names, ["body_spine", "spine", "body_root", "body"])
+
+    if all(
+        idx is None
+        for idx in (
+            leg_back_left_hip,
+            leg_back_right_hip,
+            leg_front_left_hip,
+            leg_front_right_hip,
+        )
+    ):
         return []
 
     frame_count = int(max(1, round(duration * fps)))
@@ -153,23 +174,80 @@ def build_walk_keyframes(
     base_keyframes: list[np.ndarray] = []
     for t in times:
         phase = (t / duration) * (2.0 * np.pi)
-        swing_a = float(np.sin(phase) * leg_swing)
-        swing_b = float(np.sin(phase + np.pi) * leg_swing)
+        back_phase = phase + WALK_BACK_PHASE_OFFSET
+        swing_front = float(np.sin(phase))
+        swing_front_opp = float(np.sin(phase + np.pi))
+        swing_back = float(np.sin(back_phase))
+        swing_back_opp = float(np.sin(back_phase + np.pi))
+        lift_front = max(0.0, float(np.sin(phase)))
+        lift_front_opp = max(0.0, float(np.sin(phase + np.pi)))
+        lift_back = max(0.0, float(np.sin(back_phase)))
+        lift_back_opp = max(0.0, float(np.sin(back_phase + np.pi)))
         frame = np.array(base, copy=True)
-        # [修复2] 分离前后肢逻辑
-        # 前肢：父级是 Root，通常 X 轴是前后摆动
-        if leg_front_left is not None:
-            frame[leg_front_left] = _apply_local_rotation(base[leg_front_left], _rotation_x(swing_a))
-        if leg_front_right is not None:
-            frame[leg_front_right] = _apply_local_rotation(base[leg_front_right], _rotation_x(swing_b))
-            
-        # 后肢：父级是 Spine，如果 X 轴导致横移，尝试改用 Z 轴
-        # 注意：这里假设 Z 轴是修正方向。如果变成"自转/扭曲"，请改回 _rotation_x 并尝试 _rotation_y
-        if leg_back_right is not None:
-            frame[leg_back_right] = _apply_local_rotation(base[leg_back_right], _rotation_z(swing_a))
-        if leg_back_left is not None:
-            frame[leg_back_left] = _apply_local_rotation(base[leg_back_left], _rotation_z(swing_b))
-            
+
+        if spine_idx is not None:
+            frame[spine_idx] = _apply_local_rotation(
+                base[spine_idx], _rotation_y(WALK_SPINE_SWAY * np.sin(phase))
+            )
+        if neck_idx is not None:
+            frame[neck_idx] = _apply_local_rotation(
+                base[neck_idx], _rotation_x(WALK_NECK_PITCH * np.sin(phase + np.pi / 2.0))
+            )
+        if head_idx is not None:
+            frame[head_idx] = _apply_local_rotation(
+                base[head_idx], _rotation_x(WALK_HEAD_PITCH * np.sin(phase + np.pi / 2.0))
+            )
+
+        if leg_front_left_hip is not None:
+            frame[leg_front_left_hip] = _apply_local_rotation(
+                base[leg_front_left_hip], _rotation_x(swing_front * leg_swing)
+            )
+        if leg_front_left_knee is not None:
+            frame[leg_front_left_knee] = _apply_local_rotation(
+                base[leg_front_left_knee], _rotation_x(lift_front * WALK_KNEE_LIFT)
+            )
+        if leg_front_left_ankle is not None:
+            frame[leg_front_left_ankle] = _apply_local_rotation(
+                base[leg_front_left_ankle], _rotation_x(lift_front * WALK_ANKLE_LIFT)
+            )
+        if leg_front_right_hip is not None:
+            frame[leg_front_right_hip] = _apply_local_rotation(
+                base[leg_front_right_hip], _rotation_x(swing_front_opp * leg_swing)
+            )
+        if leg_front_right_knee is not None:
+            frame[leg_front_right_knee] = _apply_local_rotation(
+                base[leg_front_right_knee], _rotation_x(lift_front_opp * WALK_KNEE_LIFT)
+            )
+        if leg_front_right_ankle is not None:
+            frame[leg_front_right_ankle] = _apply_local_rotation(
+                base[leg_front_right_ankle], _rotation_x(lift_front_opp * WALK_ANKLE_LIFT)
+            )
+
+        if leg_back_right_hip is not None:
+            frame[leg_back_right_hip] = _apply_local_rotation(
+                base[leg_back_right_hip], _rotation_z(swing_back * leg_swing)
+            )
+        if leg_back_right_knee is not None:
+            frame[leg_back_right_knee] = _apply_local_rotation(
+                base[leg_back_right_knee], _rotation_z(lift_back * WALK_KNEE_LIFT)
+            )
+        if leg_back_right_ankle is not None:
+            frame[leg_back_right_ankle] = _apply_local_rotation(
+                base[leg_back_right_ankle], _rotation_z(lift_back * WALK_ANKLE_LIFT)
+            )
+        if leg_back_left_hip is not None:
+            frame[leg_back_left_hip] = _apply_local_rotation(
+                base[leg_back_left_hip], _rotation_z(swing_back_opp * leg_swing)
+            )
+        if leg_back_left_knee is not None:
+            frame[leg_back_left_knee] = _apply_local_rotation(
+                base[leg_back_left_knee], _rotation_z(lift_back_opp * WALK_KNEE_LIFT)
+            )
+        if leg_back_left_ankle is not None:
+            frame[leg_back_left_ankle] = _apply_local_rotation(
+                base[leg_back_left_ankle], _rotation_z(lift_back_opp * WALK_ANKLE_LIFT)
+            )
+
         base_keyframes.append(frame)
 
     keyframes: list[np.ndarray] = []

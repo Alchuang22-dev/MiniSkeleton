@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtCore import QTimer
-from PySide6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtCore import QTimer, Qt
+from PySide6.QtWidgets import QLabel, QPushButton, QSlider, QVBoxLayout, QWidget
 
 
 class ActionTimeline(QWidget):
@@ -41,6 +41,8 @@ class ActionTimeline(QWidget):
 
         self.play_button: QPushButton | None = None
         self.status_label: QLabel | None = None
+        self.frame_slider: QSlider | None = None
+        self._updating_slider = False
 
         self._build_ui()
 
@@ -75,6 +77,12 @@ class ActionTimeline(QWidget):
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
+        self.frame_slider = QSlider(Qt.Horizontal)
+        self.frame_slider.setRange(0, 0)
+        self.frame_slider.setEnabled(False)
+        self.frame_slider.valueChanged.connect(self._on_slider_changed)
+        layout.addWidget(self.frame_slider)
+
         layout.addStretch()
 
     # ----------------------------------------------------------------- Logic
@@ -87,6 +95,7 @@ class ActionTimeline(QWidget):
         self.keyframes.append(np.array(transforms, copy=True))
         self.current_frame_index = len(self.keyframes) - 1
         self._notify(f"Recorded keyframe #{self.current_frame_index}")
+        self._update_slider()
         self._refresh_status()
 
     def clear_keyframes(self):
@@ -94,6 +103,7 @@ class ActionTimeline(QWidget):
         self.keyframes.clear()
         self.current_frame_index = -1
         self._notify("Cleared all keyframes.")
+        self._update_slider()
         self._refresh_status()
 
     def set_keyframes(self, keyframes: list[np.ndarray], *, current_index: int = 0) -> None:
@@ -103,6 +113,7 @@ class ActionTimeline(QWidget):
             self.current_frame_index = max(0, min(int(current_index), len(self.keyframes) - 1))
         else:
             self.current_frame_index = -1
+        self._update_slider()
         self._refresh_status()
 
     def _generate_demo_keyframes(self):
@@ -162,6 +173,7 @@ class ActionTimeline(QWidget):
         self.current_frame_index = (self.current_frame_index + 1) % len(self.keyframes)
         self.set_transforms(np.array(self.keyframes[self.current_frame_index], copy=True))
         self.on_update_mesh()
+        self._update_slider()
         self._refresh_status()
 
     def reset(self):
@@ -180,6 +192,36 @@ class ActionTimeline(QWidget):
         state = "playing" if self.is_playing else "stopped"
         idx_str = self.current_frame_index if self.current_frame_index >= 0 else "-"
         self.status_label.setText(f"Keyframes: {count} | Current: {idx_str} | State: {state}")
+
+    def _update_slider(self) -> None:
+        if self.frame_slider is None:
+            return
+        self._updating_slider = True
+        try:
+            count = len(self.keyframes)
+            if count <= 0:
+                self.frame_slider.setEnabled(False)
+                self.frame_slider.setRange(0, 0)
+                self.frame_slider.setValue(0)
+                return
+            self.frame_slider.setEnabled(True)
+            self.frame_slider.setRange(0, count - 1)
+            idx = self.current_frame_index if self.current_frame_index >= 0 else 0
+            self.frame_slider.setValue(idx)
+        finally:
+            self._updating_slider = False
+
+    def _on_slider_changed(self, value: int) -> None:
+        if self._updating_slider:
+            return
+        if not self.keyframes:
+            return
+        if value < 0 or value >= len(self.keyframes):
+            return
+        self.current_frame_index = int(value)
+        self.set_transforms(np.array(self.keyframes[self.current_frame_index], copy=True))
+        self.on_update_mesh()
+        self._refresh_status()
 
     def _notify(self, msg: str):
         if self.on_status:

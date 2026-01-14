@@ -4,13 +4,11 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
-    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
-    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -81,24 +79,27 @@ class RigControlPanel(QWidget):
     # ------------------------------------------------------------------ UI
 
     def _build_ui(self):
-        self.setFixedWidth(260)
+        self.setMinimumWidth(520)
         outer_layout = QVBoxLayout(self)
-        outer_layout.setContentsMargins(0, 0, 0, 0)
-        outer_layout.setSpacing(0)
+        outer_layout.setContentsMargins(10, 10, 10, 10)
+        outer_layout.setSpacing(10)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setFrameShape(QFrame.NoFrame)
+        columns_layout = QHBoxLayout()
+        columns_layout.setSpacing(10)
+        left_column = QVBoxLayout()
+        left_column.setSpacing(10)
+        right_column = QVBoxLayout()
+        right_column.setSpacing(10)
 
-        container = QWidget()
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(10)
+        def add_group(widget: QWidget, column: int) -> None:
+            if column == 0:
+                left_column.addWidget(widget)
+            else:
+                right_column.addWidget(widget)
 
         title = QLabel("Spot Rig Tool")
         title.setObjectName("TitleLabel")
-        layout.addWidget(title)
+        outer_layout.addWidget(title)
 
         # Model file
         if self.on_load_model is not None:
@@ -120,7 +121,7 @@ class RigControlPanel(QWidget):
             model_layout.addWidget(btn_load)
 
             model_group.setLayout(model_layout)
-            layout.addWidget(model_group)
+            add_group(model_group, 0)
 
         # Controls
         control_group = QGroupBox("Controls")
@@ -130,7 +131,7 @@ class RigControlPanel(QWidget):
         reset_button.clicked.connect(self.on_reset)
         control_layout.addWidget(reset_button)
         control_group.setLayout(control_layout)
-        layout.addWidget(control_group)
+        add_group(control_group, 0)
 
         # Skinning
         skinning_group = QGroupBox("Skinning")
@@ -158,7 +159,7 @@ class RigControlPanel(QWidget):
         skinning_layout.addWidget(mode_info)
 
         skinning_group.setLayout(skinning_layout)
-        layout.addWidget(skinning_group)
+        add_group(skinning_group, 0)
 
         # Skeleton compile controls (optional)
         if self._compile_callbacks["on_toggle_compile"] is not None:
@@ -177,7 +178,7 @@ class RigControlPanel(QWidget):
             )
             compile_layout.addWidget(self.compile_panel)
             compile_group.setLayout(compile_layout)
-            layout.addWidget(compile_group)
+            add_group(compile_group, 1)
 
         # Video export
         if self.on_render_frames is not None:
@@ -223,7 +224,7 @@ class RigControlPanel(QWidget):
             video_layout.addWidget(btn_video)
 
             video_group.setLayout(video_layout)
-            layout.addWidget(video_group)
+            add_group(video_group, 1)
 
         # Debug export
         if (
@@ -250,24 +251,23 @@ class RigControlPanel(QWidget):
                 debug_layout.addWidget(btn_weights)
 
             debug_group.setLayout(debug_layout)
-            layout.addWidget(debug_group)
+            add_group(debug_group, 1)
 
         # Timeline
         anim_group = QGroupBox("Animation / Keyframes")
         anim_layout = QVBoxLayout()
         anim_layout.addWidget(self.timeline_widget)
         anim_group.setLayout(anim_layout)
-        layout.addWidget(anim_group)
-
-        layout.addStretch()
+        add_group(anim_group, 0)
+        columns_layout.addLayout(left_column, 1)
+        columns_layout.addLayout(right_column, 1)
+        outer_layout.addLayout(columns_layout)
 
         info_label = QLabel("Spot Demo · Heat Weights + LBS + Keyframes")
         info_label.setObjectName("FooterLabel")
         info_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(info_label)
-
-        scroll.setWidget(container)
-        outer_layout.addWidget(scroll)
+        outer_layout.addWidget(info_label)
+        outer_layout.addStretch(1)
 
     # ------------------------------------------------------------------ API
 
