@@ -57,6 +57,10 @@ def _bone_edges_from_parents(parents: np.ndarray) -> np.ndarray:
     """(B,2) array of (parent, child) indices."""
     return np.array([(p, i) for i, p in enumerate(parents) if p >= 0], dtype=np.int32)
 
+def _is_trunk_joint(name: str) -> bool:
+    lower = name.lower()
+    return ("body" in lower) or ("spine" in lower) or ("torso" in lower)
+
 def _incident_bones_per_joint(J: int, edges: np.ndarray) -> List[List[int]]:
     """List of incident bone indices for each joint."""
     inc = [[] for _ in range(J)]
@@ -99,6 +103,7 @@ def _project_point_to_segments_batch(
 class HeatWeightsConfig:
     # Heat kernel / diffusion
     sigma: Optional[float] = None        # 距离高斯核 σ；None=>自动（与骨段长度相关）
+    trunk_sigma_scale: float = 1.5       # trunk joints (body/spine) sigma multiplier
     tau: float = 0.5                     # 扩散时间步（I - τ L_rw）的 τ
     # Seeds & building
     chunk_size: int = 131072             # 顶点分块大小
@@ -150,15 +155,23 @@ def compute_heat_weights(mesh: Mesh, skel, cfg: Optional[HeatWeightsConfig] = No
 
     J = len(skel.joints)
     Jpos = _global_bind_positions(skel)        # (J,3)
+    joint_names = [j.name for j in skel.joints]
     A = Jpos[edges[:, 0]]                      # (B,3)
     B = Jpos[edges[:, 1]]                      # (B,3)
     seg_len = np.linalg.norm(B - A, axis=1)    # (B,)
     # σ 自动估计：中位骨段长度的一半（经验值）
     if cfg.sigma is None:
         med = float(np.median(seg_len))
-        cfg_sigma = max(0.5 * med, 1e-3)
+        cfg_sigma = max(1.0 * med, 1e-3)
     else:
         cfg_sigma = float(cfg.sigma)
+
+    trunk_scale = max(1.0, float(cfg.trunk_sigma_scale))
+    sigma_per_joint = np.full(J, cfg_sigma, dtype=np.float32)
+    if trunk_scale != 1.0:
+        for j, name in enumerate(joint_names):
+            if _is_trunk_joint(name):
+                sigma_per_joint[j] = cfg_sigma * trunk_scale
 
     # 计算网格邻接与拉普拉斯
     neighbors, L = compute_vertex_adjacency(mesh)
@@ -204,13 +217,14 @@ def compute_heat_weights(mesh: Mesh, skel, cfg: Optional[HeatWeightsConfig] = No
     S = np.zeros((N, J), dtype=np.float32)
     for j in range(J):
         bones_j = inc_bones[j]
+        sigma_j = float(sigma_per_joint[j])
         if len(bones_j) == 0:
             # 没有相邻骨段（例如单根，极少见）：退化为点源（到关节点距离）
             dv = np.linalg.norm(V - Jpos[j][None, :], axis=1).astype(np.float32)
-            Sj = np.exp(-(dv / cfg_sigma) ** 2, dtype=np.float32)
+            Sj = np.exp(-(dv / sigma_j) ** 2, dtype=np.float32)
         else:
             dj = np.min(d_all[:, bones_j], axis=1)
-            Sj = np.exp(-(dj / cfg_sigma) ** 2, dtype=np.float32)
+            Sj = np.exp(-(dj / sigma_j) ** 2, dtype=np.float32)
         S[:, j] = Sj
 
     # 逐关节求解 (I - τ L_rw) w_j = s_j

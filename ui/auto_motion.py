@@ -13,6 +13,9 @@ DEMO_FPS = 30
 DEMO_DURATION = 1.5
 DEMO_HEAD_YAW = 0.35
 DEMO_NECK_YAW = 0.15
+DEMO_EAR_YAW_SCALE = 0.4
+DEMO_HORN_YAW_SCALE = 0.35
+DEMO_MOUTH_YAW_SCALE = 0.25
 
 WALK_BASE_DURATION = 2.0
 WALK_REPEAT = 5
@@ -72,6 +75,12 @@ def build_head_shake_keyframes(
     names = list(joint_names)
     head_idx = pick_joint_index(names, ["head", "neck_mid", "neck_root", "neck"])
     neck_idx = pick_joint_index(names, ["neck_mid", "neck_root", "neck"])
+    ear_l_idx = pick_joint_index(names, ["ear_L", "ear_L_leaf"])
+    ear_r_idx = pick_joint_index(names, ["ear_R", "ear_R_leaf"])
+    horn_l_idx = pick_joint_index(names, ["horn_L", "horn_L_leaf"])
+    horn_r_idx = pick_joint_index(names, ["horn_R", "horn_R_leaf"])
+    mouth_l_idx = pick_joint_index(names, ["mouth_corner_L", "mouth_corner_L_leaf"])
+    mouth_r_idx = pick_joint_index(names, ["mouth_corner_R", "mouth_corner_R_leaf"])
     if head_idx is None and neck_idx is None:
         return []
 
@@ -88,6 +97,30 @@ def build_head_shake_keyframes(
             frame[head_idx] = _apply_local_rotation(base[head_idx], _rotation_y(head_angle))
         if neck_idx is not None and neck_idx != head_idx:
             frame[neck_idx] = _apply_local_rotation(base[neck_idx], _rotation_y(neck_angle))
+        if ear_l_idx is not None:
+            frame[ear_l_idx] = _apply_local_rotation(
+                base[ear_l_idx], _rotation_y(head_angle * DEMO_EAR_YAW_SCALE)
+            )
+        if ear_r_idx is not None:
+            frame[ear_r_idx] = _apply_local_rotation(
+                base[ear_r_idx], _rotation_y(head_angle * DEMO_EAR_YAW_SCALE)
+            )
+        if horn_l_idx is not None:
+            frame[horn_l_idx] = _apply_local_rotation(
+                base[horn_l_idx], _rotation_y(head_angle * DEMO_HORN_YAW_SCALE)
+            )
+        if horn_r_idx is not None:
+            frame[horn_r_idx] = _apply_local_rotation(
+                base[horn_r_idx], _rotation_y(head_angle * DEMO_HORN_YAW_SCALE)
+            )
+        if mouth_l_idx is not None:
+            frame[mouth_l_idx] = _apply_local_rotation(
+                base[mouth_l_idx], _rotation_y(head_angle * DEMO_MOUTH_YAW_SCALE)
+            )
+        if mouth_r_idx is not None:
+            frame[mouth_r_idx] = _apply_local_rotation(
+                base[mouth_r_idx], _rotation_y(head_angle * DEMO_MOUTH_YAW_SCALE)
+            )
         keyframes.append(frame)
     return keyframes
 
@@ -114,7 +147,14 @@ def build_walk_keyframes(
     )
     leg_back_left_ankle = pick_joint_index(
         names,
-        ["leg_back_L_ankle", "leg_back_l_ankle", "hind_left_ankle", "back_left_ankle", "leg1_ankle"],
+        [
+            "leg_back_L_ankle",
+            "leg_back_L_ankle_leaf",
+            "leg_back_l_ankle",
+            "hind_left_ankle",
+            "back_left_ankle",
+            "leg1_ankle",
+        ],
     )
     leg_back_right_hip = pick_joint_index(
         names,
@@ -126,7 +166,14 @@ def build_walk_keyframes(
     )
     leg_back_right_ankle = pick_joint_index(
         names,
-        ["leg_back_R_ankle", "leg_back_r_ankle", "hind_right_ankle", "back_right_ankle", "leg2_ankle"],
+        [
+            "leg_back_R_ankle",
+            "leg_back_R_ankle_leaf",
+            "leg_back_r_ankle",
+            "hind_right_ankle",
+            "back_right_ankle",
+            "leg2_ankle",
+        ],
     )
     leg_front_left_hip = pick_joint_index(
         names,
@@ -138,7 +185,13 @@ def build_walk_keyframes(
     )
     leg_front_left_ankle = pick_joint_index(
         names,
-        ["leg_front_L_ankle", "leg_front_l_ankle", "front_left_ankle", "leg3_ankle"],
+        [
+            "leg_front_L_ankle",
+            "leg_front_L_ankle_leaf",
+            "leg_front_l_ankle",
+            "front_left_ankle",
+            "leg3_ankle",
+        ],
     )
     leg_front_right_hip = pick_joint_index(
         names,
@@ -150,7 +203,13 @@ def build_walk_keyframes(
     )
     leg_front_right_ankle = pick_joint_index(
         names,
-        ["leg_front_R_ankle", "leg_front_r_ankle", "front_right_ankle", "leg4_ankle"],
+        [
+            "leg_front_R_ankle",
+            "leg_front_R_ankle_leaf",
+            "leg_front_r_ankle",
+            "front_right_ankle",
+            "leg4_ankle",
+        ],
     )
 
     neck_idx = pick_joint_index(names, ["neck_mid", "neck_root", "neck"])
