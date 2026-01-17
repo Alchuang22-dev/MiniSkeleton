@@ -91,7 +91,7 @@ class SkeletonCompilePanel(QWidget):
         btn_recompute.clicked.connect(self._on_recompute_weights)
         layout.addWidget(btn_recompute)
 
-        btn_reset_bind = QPushButton("Reset bind pose")
+        btn_reset_bind = QPushButton("Restore original skeleton")
         btn_reset_bind.clicked.connect(self._on_reset_bind)
         layout.addWidget(btn_reset_bind)
 

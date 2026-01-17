@@ -469,6 +469,26 @@ class SpotRigWindow(QMainWindow):
                 self.joint_parents,
                 self.bind_positions,
             )
+        self._finalize_skeleton_rebuild()
+
+    def _rebuild_skeleton_from_bind_globals(self, bind_globals: np.ndarray) -> None:
+        if bind_globals is None:
+            return
+        bind_globals = np.asarray(bind_globals, dtype=np.float32)
+        if bind_globals.ndim != 3 or bind_globals.shape[1:] != (4, 4):
+            return
+        self.skeleton = Skeleton.from_bind_matrices(
+            self.joint_names,
+            self.joint_parents,
+            bind_globals,
+        )
+        self._bind_locals = [np.array(j.bind_local, copy=True) for j in self.skeleton.joints]
+        self.bind_positions = bind_globals[:, :3, 3].astype(np.float32, copy=True)
+        self._finalize_skeleton_rebuild()
+
+    def _finalize_skeleton_rebuild(self) -> None:
+        if self.skeleton is None:
+            return
         self.bones = [
             (j.parent, i)
             for i, j in enumerate(self.skeleton.joints)
@@ -528,9 +548,15 @@ class SpotRigWindow(QMainWindow):
         if parent_idx >= 0 and self._is_descendant(parent_idx, child_idx):
             self._notify("Invalid parent: would create a cycle.")
             return
-
+        bind_globals = None
+        if self.skeleton is not None:
+            bind_locals = [j.bind_local for j in self.skeleton.joints]
+            bind_globals = self.skeleton.forward_kinematics_local(bind_locals)
         self.joint_parents[child_idx] = int(parent_idx)
-        self._rebuild_skeleton_from_bind()
+        if bind_globals is not None:
+            self._rebuild_skeleton_from_bind_globals(bind_globals)
+        else:
+            self._rebuild_skeleton_from_bind()
         if self.toolbar:
             self.toolbar.set_joint_names(self.joint_names)
         self.update_viewport_full()
@@ -544,8 +570,15 @@ class SpotRigWindow(QMainWindow):
         if self.joint_parents[child_idx] == -1:
             self._notify("Selected joint is already a root.")
             return
+        bind_globals = None
+        if self.skeleton is not None:
+            bind_locals = [j.bind_local for j in self.skeleton.joints]
+            bind_globals = self.skeleton.forward_kinematics_local(bind_locals)
         self.joint_parents[child_idx] = -1
-        self._rebuild_skeleton_from_bind()
+        if bind_globals is not None:
+            self._rebuild_skeleton_from_bind_globals(bind_globals)
+        else:
+            self._rebuild_skeleton_from_bind()
         if self.toolbar:
             self.toolbar.set_joint_names(self.joint_names)
         self.update_viewport_full()
@@ -560,7 +593,17 @@ class SpotRigWindow(QMainWindow):
         self.bind_positions = np.array(self._orig_bind_positions, copy=True)
         if self._orig_bind_locals is not None:
             self._bind_locals = [np.array(m, copy=True) for m in self._orig_bind_locals]
-        self._rebuild_skeleton_from_bind()
+            J = len(self._bind_locals)
+            bind_globals = np.zeros((J, 4, 4), dtype=np.float32)
+            for j in range(J):
+                p = self.joint_parents[j]
+                if p < 0:
+                    bind_globals[j] = self._bind_locals[j]
+                else:
+                    bind_globals[j] = bind_globals[p] @ self._bind_locals[j]
+            self._rebuild_skeleton_from_bind_globals(bind_globals)
+        else:
+            self._rebuild_skeleton_from_bind()
         if self.toolbar:
             self.toolbar.set_joint_names(self.joint_names)
         self.recompute_weights()
