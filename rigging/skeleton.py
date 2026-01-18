@@ -9,7 +9,7 @@ import numpy as np
 class Joint:
     name: str
     parent: Optional[str]
-    bind_pose: np.ndarray      # (4,4) 关节在绑定时的局部/或全局矩阵（按你的约定）
+    bind_pose: np.ndarray      # (4,4) 关节在绑定时的局部/或全局矩阵
     offset_matrix: np.ndarray  # (4,4) 逆绑定矩阵（skin bind）
 
 

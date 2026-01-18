@@ -7,7 +7,7 @@ render/offscreen_mgl.py
 - API 尽量简单，只暴露一个 `OffscreenRenderer.render_mesh(...)`。
 
 注意：
-- 这是一个“可运行骨架”，你可以在之后补充：
+- 这是一个“可运行骨架”，可补充：
   - 纹理 / 法线 / 阴影 / 多光源等；
   - 多个 mesh 的同时渲染；
   - 高级相机控制（轨迹球、FOV 等）。

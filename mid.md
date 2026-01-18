@@ -1,9 +1,5 @@
 # 项目中期文档
 
-> 张泽宇 2022012117 zhangzey22@mails.tsinghua.edu.cn
-> 中期文档中的图片不代表最终效果
-> 代码仓库：https://github.com/Alchuang22-dev/MiniSkeleton.git
-
 ## 1. 骨架关节点的创建思路
 
 ### 1.1 目标与约束
